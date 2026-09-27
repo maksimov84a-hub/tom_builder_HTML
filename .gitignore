@@ -1,0 +1,12 @@
+# Зависимости и артефакты — не коммитятся
+vendor/
+wheels/
+__pycache__/
+*.pyc
+tmp/
+*.egg-info/
+.venv/
+venv/
+
+# Worktrees Compose
+.worktrees/dsh-session-*.zip
