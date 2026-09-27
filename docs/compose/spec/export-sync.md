@@ -1,14 +1,25 @@
 ---
 feature: export-sync
-status: in-progress
+status: delivered
 updated: 2026-02-14
 branch: feature/export-sync
-commits: 
+commits: 38eb2a9..a2a0a4b
 ---
 
 # Синхронизация экспорта тома со структурой (этап A)
 
 ## Report
+
+**What was built** — Сборка DOCX/PDF теперь идёт строго по `project.structure` (порядок + `needed`): `build_text_docx` обходит текстовые разделы по дереву и включает лист регистрации изменений при непустом журнале; `build_full_pdf` группирует structure в сегменты (text / graphic / appendix) и склеивает PDF в порядке дерева. Перед сборкой в UI выполняется preflight (`app/core/preflight.py`): ошибки блокируют экспорт, предупреждения — диалогом «Продолжить/Отмена»; проверка файлов учитывает `structure.needed`. Диагностика: падение PDF показывает причину и путь к `tmp/build.log`, ошибка наложения штампов пробрасывается (не «Готово» без рамок), `merge_pdfs` возвращает фактический `page_count` и сообщает путь битого входа.
+
+**Verification** — `python tmp/check_preflight.py` PASS; `python tmp/check_t2_docx.py` PASS (порядок/needed/subset/changes); `python tmp/check_t3_pdf.py` PASS (сегменты, перестановка, pages=7); `python tmp/check_t4_merge.py` PASS (page_count=5, ошибка с путём); stamp-propagation one-liner PASS; `py_compile` 5 файлов PASS; structure-gate preflight one-liner PASS. Независимое ревью (general-1): критичных нет; major (preflight без structure-gate) исправлен и перепроверен; minor с дублем `TEXT_SECTION_KINDS` устранён. `tests/` отсутствует — PRE-EXISTING (этап B).
+
+**Journey log**
+1. Работа в основном чекауте на `feature/export-sync` — `git worktree add` заблокирован песочницей (общий ref store).
+2. Перегрузка tool-calls: дубли запросов отменялись системой; полезно держать партии ≤3 вызовов.
+3. Кириллица в fallback-PDF не извлекается как текст (шрифт) — smoke-тесты проверяют ASCII-содержимое (цифры/даты).
+4. Два текстовых сегмента затирали один временный файл — добавлен уникальный `tag` (`_text_part_seg0.pdf`, `_text_part_seg3.pdf`).
+5. Ревью поймало structure-gate в preflight: файлы отключённых разделов не должны блокировать сборку.
 
 ## [S1] Problem
 
@@ -81,7 +92,7 @@ commits:
 
 ## Tasks
 
-- [ ] T1: `app/core/preflight.py` — `run_preflight(project)` с errors/warnings по контракту S2; acceptance: отсутствующий путь документа → error; включён `changes` при пустом журнале → warning; пустые реквизиты → warning (covers: S2)
-- [ ] T2: `build_text_docx` — сборка строго по `project.structure` (порядок + needed), пропуск `changes` при пустом журнале; acceptance: структура без `content` → в DOCX нет листа содержания; structure с changes и записями → лист изменений присутствует; порядок разделов в DOCX = порядку structure (covers: S2)
-- [ ] T3: `build_full_pdf` — сегментация structure, склейка PDF в порядке structure; `build_text_docx` получает параметр `kinds: list[str] | None`; acceptance: по умолчанию PDF = text(cover,title,content,pz) → graphic → appendix → changes; отключённый раздел отсутствует; перестановка graphic/appendix в structure меняет порядок в PDF; `changes` в середине structure попадает в свою позицию (covers: S2; depends: T1, T2)
-- [ ] T4: диагностика: `main_window._build` показывает причину падения PDF и пишет `tmp/build.log`; `pdf_builder` не глушит ошибку наложения штампов; `merge_pdfs` возвращает фактический page_count; acceptance: падение `_stamp_text_pages` → пользователь видит текст ошибки, не «Готово»; `merge_pdfs([a], out)` == page_count файла a (covers: S2; depends: T2)
+- [x] T1: `app/core/preflight.py` — `run_preflight(project)` с errors/warnings по контракту S2; acceptance: отсутствующий путь документа → error; включён `changes` при пустом журнале → warning; пустые реквизиты → warning (covers: S2)
+- [x] T2: `build_text_docx` — сборка строго по `project.structure` (порядок + needed), пропуск `changes` при пустом журнале; acceptance: структура без `content` → в DOCX нет листа содержания; structure с changes и записями → лист изменений присутствует; порядок разделов в DOCX = порядку structure (covers: S2)
+- [x] T3: `build_full_pdf` — сегментация structure, склейка PDF в порядке structure; `build_text_docx` получает параметр `kinds: list[str] | None`; acceptance: по умолчанию PDF = text(cover,title,content,pz) → graphic → appendix → changes; отключённый раздел отсутствует; перестановка graphic/appendix в structure меняет порядок в PDF; `changes` в середине structure попадает в свою позицию (covers: S2; depends: T1, T2)
+- [x] T4: диагностика: `main_window._build` показывает причину падения PDF и пишет `tmp/build.log`; `pdf_builder` не глушит ошибку наложения штампов; `merge_pdfs` возвращает фактический page_count; acceptance: падение `_stamp_text_pages` → пользователь видит текст ошибки, не «Готово»; `merge_pdfs([a], out)` == page_count файла a (covers: S2; depends: T2)
