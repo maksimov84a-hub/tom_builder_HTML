@@ -14,7 +14,11 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from ..models import VolumeProject, DocKind, Stage, SECTION_LABELS
+from ..models import (
+    VolumeProject, DocKind, Stage, SECTION_LABELS,
+    SECTION_COVER, SECTION_TITLE, SECTION_CONTENT, SECTION_PZ,
+    SECTION_CHANGES,
+)
 from ..config import Config, FontMap, PageMargins, A4_MM, FONT_NAME
 from .docx_reader import read_docx
 from .toc import content_rows
@@ -63,10 +67,35 @@ def _set_run(run, font: str, size_pt: float, bold=False):
     rFonts.set('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}cs', font)
 
 
-def build_text_docx(project: VolumeProject, out_path: str, config: Config | None = None) -> str:
+# Текстовые kinds, участвующие в DOCX-томе (графика/приложения не входят).
+TEXT_SECTION_KINDS = (
+    SECTION_COVER, SECTION_TITLE, SECTION_CONTENT, SECTION_PZ, SECTION_CHANGES,
+)
+
+
+def _structure_text_kinds(project: VolumeProject) -> list:
+    """Порядок текстовых разделов из project.structure (только needed)."""
+    kinds = []
+    for entry in project.structure or []:
+        if not entry.get("needed", True):
+            continue
+        kind = entry.get("kind") or ""
+        if kind in TEXT_SECTION_KINDS:
+            kinds.append(kind)
+    return kinds
+
+
+def build_text_docx(project: VolumeProject, out_path: str,
+                    config: Config | None = None,
+                    kinds: list | None = None) -> str:
     """Собирает DOCX текстовой части тома.
 
-    Возвращает путь к созданному DOCX.
+    Порядок и состав разделов берутся из ``project.structure`` (отфильтрованной
+    по ``needed``). Параметр ``kinds`` позволяет собрать только указанные
+    текстовые разделы (используется при сегментации PDF-сборки).
+
+    Графика и приложения в текстовый DOCX не включаются (SPEC: DOC — без
+    графики и приложений). Возвращает путь к созданному DOCX.
     """
     config = config or Config()
     fm: FontMap = config.font_map
@@ -75,37 +104,53 @@ def build_text_docx(project: VolumeProject, out_path: str, config: Config | None
 
     from docx import Document
     from docx.enum.section import WD_SECTION
-    from docx.oxml.ns import qn
+
+    if kinds is None:
+        text_kinds = _structure_text_kinds(project)
+    else:
+        text_kinds = [k for k in kinds if k in TEXT_SECTION_KINDS]
+    # changes в DOCX попадает только при непустом журнале
+    text_kinds = [
+        k for k in text_kinds
+        if k != SECTION_CHANGES or project.changes
+    ]
 
     doc = Document()
     # ---- Раздел по умолчанию: A4, поля ГОСТ ----
     _set_section(A4_MM[0], A4_MM[1], mm, doc.sections[0])
 
-    # ---- Обложка (первый лист) — отдельный раздел БЕЗ рамки и БЕЗ штампа ----
-    _add_cover(doc, project, fm, font)
+    for i, kind in enumerate(text_kinds):
+        if i == 0:
+            sec = doc.sections[0]
+        else:
+            sec = doc.add_section(WD_SECTION.NEW_PAGE)
+            _set_section(A4_MM[0], A4_MM[1], mm, sec)
 
-    # ---- Титульный лист — отдельный раздел БЕЗ рамки и БЕЗ штампа ----
-    title_sec = doc.add_section(WD_SECTION.NEW_PAGE)
-    _set_section(A4_MM[0], A4_MM[1], mm, title_sec)
-    _add_title_sheet(doc, project, fm, font)
-    _no_stamp_section(title_sec)
+        if kind == SECTION_COVER:
+            _add_cover(doc, project, fm, font)
+            _no_stamp_section(sec)
+        elif kind == SECTION_TITLE:
+            _add_title_sheet(doc, project, fm, font)
+            _no_stamp_section(sec)
+        elif kind == SECTION_CONTENT:
+            _add_content(doc, project, fm, font)
+            _add_stamp_footers(doc, project, config, sec, first_form=FORM_TEXT_FIRST)
+        elif kind == SECTION_PZ:
+            _add_pz_toc(doc, project, fm, font)
+            for src in project.documents_for(DocKind.POYASNITELNAYA):
+                _add_pz_doc(doc, src.path, fm, font)
+            _add_stamp_footers(doc, project, config, sec, first_form=FORM_TEXT_FIRST)
+        elif kind == SECTION_CHANGES:
+            _add_changes_sheet(doc, project, fm, font)
+            _add_stamp_footers(doc, project, config, sec, first_form=FORM_TEXT_FIRST)
 
-    # ---- Содержание — отдельный раздел, форма 5 (первый лист) ----
-    content_sec = doc.add_section(WD_SECTION.NEW_PAGE)
-    _set_section(A4_MM[0], A4_MM[1], mm, content_sec)
-    _add_content(doc, project, fm, font)
-    _add_stamp_footers(doc, project, config, content_sec, first_form=FORM_TEXT_FIRST)
-
-    # ---- Пояснительная записка — отдельный раздел: форма 5 (первый лист),
-    #      далее форма 6 (последующие) ----
-    pz_sec = doc.add_section(WD_SECTION.NEW_PAGE)
-    _set_section(A4_MM[0], A4_MM[1], mm, pz_sec)
-    # Автоматическое оглавление — первым листом записки (шапка «ОГЛАВЛЕНИЕ»,
-    # далее заголовки по уровням текста из Word с номерами листов).
-    _add_pz_toc(doc, project, fm, font)
-    for src in project.documents_for(DocKind.POYASNITELNAYA):
-        _add_pz_doc(doc, src.path, fm, font)
-    _add_stamp_footers(doc, project, config, pz_sec, first_form=FORM_TEXT_FIRST)
+    # Пустой текстовый том — минимальный лист, чтобы файл был валиден
+    if not text_kinds:
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _set_run(p.add_run("Нет текстовых разделов в структуре тома"),
+                 font, fm.content_header)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     doc.save(out_path)

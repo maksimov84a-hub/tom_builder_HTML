@@ -9,15 +9,79 @@ from __future__ import annotations
 import os
 import tempfile
 
-from ..models import VolumeProject, DocKind
+from ..models import (
+    VolumeProject, DocKind,
+    SECTION_COVER, SECTION_TITLE, SECTION_CONTENT, SECTION_PZ,
+    SECTION_GRAPHIC, SECTION_APPENDIX, SECTION_CHANGES,
+)
 from ..config import Config
 from .gost import FORM_GRAPHIC, FORM_TEXT_FIRST, FORM_TEXT_NEXT
 from .pdf_merge import count_pages, compute_total_sheets
 from .renderer import draw_frame_and_stamp, draw_sheet_number_box
 from .toc import content_rows as toc_content_rows
+# Единый источник текстовых kinds (не дублировать — риск расхождения).
+from .docx_exporter import TEXT_SECTION_KINDS
+
+#: kinds, попадающие в текстовый DOCX/PDF-сегмент (graphic/appendix — отдельно)
+_SEGMENT_TEXT = frozenset(TEXT_SECTION_KINDS)
+_SEGMENT_GRAPHIC = frozenset({SECTION_GRAPHIC})
+_SEGMENT_APPENDIX = frozenset({SECTION_APPENDIX})
 
 
-def _text_pdf(project: VolumeProject, cfg: Config, out_dir: str, use_word: bool = True) -> tuple[str | None, bool, list]:
+def structure_segments(project: VolumeProject) -> list:
+    """Группирует project.structure в сегменты для PDF-сборки.
+
+    Соседние текстовые kinds (cover/title/content/pz/changes) склеиваются в один
+    сегмент ("text", kinds); graphic и appendix — каждый свой сегмент.
+    Порядок сегментов = порядку structure (после фильтра needed).
+
+    Пример по умолчанию:
+        [("text", [cover,title,content,pz]), ("graphic", []),
+         ("appendix", []), ("text", [changes])]
+    """
+    segments = []
+    cur_text: list = []
+
+    def _flush_text():
+        nonlocal cur_text
+        if cur_text:
+            segments.append(("text", list(cur_text)))
+            cur_text = []
+
+    for entry in project.structure or []:
+        if not entry.get("needed", True):
+            continue
+        kind = entry.get("kind") or ""
+        if kind in _SEGMENT_TEXT:
+            # changes без журнала не создаёт сегмент
+            if kind == SECTION_CHANGES and not project.changes:
+                continue
+            cur_text.append(kind)
+        elif kind in _SEGMENT_GRAPHIC:
+            _flush_text()
+            segments.append(("graphic", [kind]))
+        elif kind in _SEGMENT_APPENDIX:
+            _flush_text()
+            segments.append(("appendix", [kind]))
+        # неизвестные kinds игнорируются
+    _flush_text()
+    return segments
+
+
+def _segment_start_sheet(project: VolumeProject, segment_kinds: list) -> int:
+    """Первый номер листа сегмента по карте toc.build_layout."""
+    from .toc import build_layout
+    lay = build_layout(project)
+    for it in lay.items:
+        if it.section_key in segment_kinds and it.count > 0 and it.first_sheet >= 1:
+            return it.first_sheet
+    return 1
+
+
+def _text_pdf(project: VolumeProject, cfg: Config, out_dir: str,
+              use_word: bool = True,
+              kinds: list | None = None,
+              tag: str = "") -> tuple[str | None, bool, list]:
     """Формирует PDF текстовой части.
 
     Если use_word и доступен Word — конвертируем DOCX через Word COM.
@@ -27,6 +91,10 @@ def _text_pdf(project: VolumeProject, cfg: Config, out_dir: str, use_word: bool 
     Иначе текстовая часть собирается напрямую через PyMuPDF (fallback) и
     требует последующего наложения штампов.
 
+    :param kinds: подмножество текстовых разделов (для сегментации PDF);
+        None — все текстовые разделы из project.structure.
+    :param tag: метка для уникальности временных файлов (сегментация PDF).
+
     Возвращает (путь_к_pdf | None, пришёл_из_word, page_forms).
     page_forms — список форм основной надписи по каждой странице текстовой части:
         None — без рамки и штампа (обложка);
@@ -35,22 +103,24 @@ def _text_pdf(project: VolumeProject, cfg: Config, out_dir: str, use_word: bool 
     """
     # Собираем DOCX текстовой части (всегда доступно)
     from .docx_exporter import build_text_docx
-    docx_path = os.path.join(out_dir, "_text_part.docx")
-    build_text_docx(project, docx_path, cfg)
+    suffix = f"_{tag}" if tag else ""
+    docx_path = os.path.join(out_dir, f"_text_part{suffix}.docx")
+    build_text_docx(project, docx_path, cfg, kinds=kinds)
 
     # 1) Если разрешён Word и он доступен — конвертируем DOCX -> PDF (максимальная точность)
     if use_word:
         try:
             from .word_com import word_available, docx_to_pdf
             if word_available():
-                pdf_path = os.path.join(out_dir, "_text_part.pdf")
+                pdf_path = os.path.join(out_dir, f"_text_part{suffix}.pdf")
                 docx_to_pdf(docx_path, pdf_path)
                 return pdf_path, True, []
         except Exception:
             pass
 
     # 2) Fallback: собрать текстовые страницы напрямую через PyMuPDF (без Word)
-    pdf_path, page_forms = _text_pdf_pymupdf(project, out_dir, cfg)
+    pdf_path, page_forms = _text_pdf_pymupdf(project, out_dir, cfg,
+                                             kinds=kinds, tag=tag)
     return pdf_path, False, page_forms
 
 
@@ -107,19 +177,31 @@ def _register_text_font(doc):
         return "helv"
 
 
-def _text_pdf_pymupdf(project, out_dir, cfg):
-    """Собирает текстовую часть (обложка/титул/содержание/ПЗ) как PDF-страницы
-    напрямую через PyMuPDF — запасной путь, когда Word COM недоступен.
+def _text_pdf_pymupdf(project, out_dir, cfg, kinds: list | None = None,
+                      tag: str = ""):
+    """Собирает текстовую часть как PDF-страницы напрямую через PyMuPDF —
+    запасной путь, когда Word COM недоступен.
+
+    :param kinds: подмножество текстовых разделов в порядке следования
+        (None — все текстовые разделы из project.structure).
+    :param tag: метка для уникальности временного файла.
 
     Возвращает (путь_к_pdf, page_forms). page_forms[i] — форма осн. надписи для
     страницы i: None (обложка — без рамки/штампа), FORM_TEXT_FIRST (первый лист
     раздела — большой штамп), FORM_TEXT_NEXT (последующий лист — малый штамп)."""
     import pymupdf
-    pdf_path = os.path.join(out_dir, "_text_part.pdf")
+    suffix = f"_{tag}" if tag else ""
+    pdf_path = os.path.join(out_dir, f"_text_part{suffix}.pdf")
     doc = pymupdf.open()
     fm = cfg.font_map
     req = project.requisites
     page_forms = []         # форма по каждой странице текстовой части
+
+    if kinds is None:
+        from .docx_exporter import _structure_text_kinds
+        kinds = _structure_text_kinds(project)
+        if SECTION_CHANGES in kinds and not project.changes:
+            kinds = [k for k in kinds if k != SECTION_CHANGES]
 
     # Шрифт с поддержкой кириллицы (ISOCPEUR, если доступен).
     fname = _register_text_font(doc)
@@ -131,63 +213,73 @@ def _text_pdf_pymupdf(project, out_dir, cfg):
         page_forms.append(form)
         return pg
 
-    # ---- Обложка (без рамки и без штампа) ----
-    pg = new_page(None)
-    pg.insert_text((72, 100), req.organization or "", fontname=fname, fontsize=18)
-    pg.insert_text((72, 140), "ОБЛОЖКА", fontname=fname, fontsize=14)
-    pg.insert_text((72, 180), req.volume_id or "", fontname=fname, fontsize=14)
+    for kind in kinds:
+        if kind == SECTION_COVER:
+            # Обложка: без рамки и без штампа
+            pg = new_page(None)
+            pg.insert_text((72, 100), req.organization or "", fontname=fname, fontsize=18)
+            pg.insert_text((72, 140), "ОБЛОЖКА", fontname=fname, fontsize=14)
+            pg.insert_text((72, 180), req.volume_id or "", fontname=fname, fontsize=14)
+        elif kind == SECTION_TITLE:
+            # Титульный лист — без рамки и штампа, form=None.
+            pg = new_page(None)
+            pg.insert_text((72, 100), req.volume_name or "", fontname=fname, fontsize=16)
+            pg.insert_text((72, 140), "ТИТУЛЬНЫЙ ЛИСТ", fontname=fname, fontsize=14)
+            pg.insert_text((72, 180), req.object_name or "", fontname=fname, fontsize=12)
+        elif kind == SECTION_CONTENT:
+            # Содержание — первый лист форма 5, №1 сквозной нумерации.
+            pg = new_page(FORM_TEXT_FIRST)
+            pg.insert_text((72, 90), "СОДЕРЖАНИЕ", fontname=fname, fontsize=14)
+            y = 120
+            for name, des, sheets in toc_content_rows(project):
+                line = f"{name}"
+                if des:
+                    line += f"  {des}"
+                if sheets:
+                    line += f"  {sheets}"
+                pg.insert_text((72, y), line, fontname=fname, fontsize=11)
+                y += 20
+        elif kind == SECTION_PZ:
+            # Оглавление ПЗ — первыми листами раздела.
+            from .docx_reader import read_docx
+            from .pz_toc import toc_page_offset
+            toc_pages = _add_toc_pages_pymupdf(project, new_page, fname, fm,
+                                               (FORM_TEXT_FIRST, FORM_TEXT_NEXT),
+                                               offset=toc_page_offset(project))
+            first_pz = not toc_pages
+            for d in project.documents_for(DocKind.POYASNITELNAYA):
+                if d.path and os.path.exists(d.path):
+                    try:
+                        content = read_docx(d.path)
+                    except Exception:
+                        continue
+                    pg = new_page(FORM_TEXT_FIRST if first_pz else FORM_TEXT_NEXT)
+                    first_pz = False
+                    y = 80
+                    for para in content.paragraphs:
+                        if not para.text.strip():
+                            continue
+                        lines = _wrap(para.text, width=90)
+                        for ln in lines:
+                            if y > 800:
+                                pg = new_page(FORM_TEXT_NEXT)
+                                y = 80
+                            pg.insert_text((72, y), ln, fontname=fname, fontsize=11)
+                            y += 16
+        elif kind == SECTION_CHANGES:
+            # Лист регистрации изменений (fallback-путь).
+            pg = new_page(FORM_TEXT_FIRST)
+            pg.insert_text((72, 90), "ЛИСТ РЕГИСТРАЦИИ ИЗМЕНЕНИЙ",
+                           fontname=fname, fontsize=13)
+            y = 130
+            for c in project.changes:
+                line = f"{c.number}  {c.date}  {c.description}"
+                pg.insert_text((72, y), line, fontname=fname, fontsize=10)
+                y += 18
 
-    # ---- Титульный лист (как и обложка — БЕЗ рамки и БЕЗ штампа) ----
-    # По ГОСТ и в предпросмотре титульный лист не штампуется и не нумеруется;
-    # первый нумерованный лист тома — содержание. Поэтому form=None.
-    pg = new_page(None)
-    pg.insert_text((72, 100), req.volume_name or "", fontname=fname, fontsize=16)
-    pg.insert_text((72, 140), "ТИТУЛЬНЫЙ ЛИСТ", fontname=fname, fontsize=14)
-    pg.insert_text((72, 180), req.object_name or "", fontname=fname, fontsize=12)
-
-    # ---- Содержание (раздел — первый лист форма 5, №1 сквозной нумерации) ----
-    # Автоматический сбор по фактической структуре тома (единый источник toc).
-    pg = new_page(FORM_TEXT_FIRST)
-    pg.insert_text((72, 90), "СОДЕРЖАНИЕ", fontname=fname, fontsize=14)
-    y = 120
-    for name, des, sheets in toc_content_rows(project):
-        line = f"{name}"
-        if des:
-            line += f"  {des}"
-        if sheets:
-            line += f"  {sheets}"
-        pg.insert_text((72, y), line, fontname=fname, fontsize=11)
-        y += 20
-
-    # ---- Пояснительная записка (первый лист — форма 5, далее форма 6) ----
-    from .docx_reader import read_docx
-    # Оглавление записки — первыми листами раздела ПЗ (первый лист — форма 5).
-    from .pz_toc import toc_page_offset
-    toc_pages = _add_toc_pages_pymupdf(project, new_page, fname, fm,
-                                       (FORM_TEXT_FIRST, FORM_TEXT_NEXT),
-                                       offset=toc_page_offset(project))
-    # Без оглавления большой штамп (форма 5) достаётся первому листу записки.
-    first_pz = not toc_pages
-    for d in project.documents_for(DocKind.POYASNITELNAYA):
-        if d.path and os.path.exists(d.path):
-            try:
-                content = read_docx(d.path)
-            except Exception:
-                continue
-            pg = new_page(FORM_TEXT_FIRST if first_pz else FORM_TEXT_NEXT)
-            first_pz = False
-            y = 80
-            for para in content.paragraphs:
-                if not para.text.strip():
-                    continue
-                lines = _wrap(para.text, width=90)
-                for ln in lines:
-                    if y > 800:
-                        # следующая страница раздела — малый штамп (форма 6)
-                        pg = new_page(FORM_TEXT_NEXT)
-                        y = 80
-                    pg.insert_text((72, y), ln, fontname=fname, fontsize=11)
-                    y += 16
+    # Минимум одна страница, чтобы файл был валидным
+    if not page_forms:
+        new_page(None).insert_text((72, 100), "", fontname=fname, fontsize=11)
 
     doc.save(pdf_path)
     doc.close()
@@ -252,7 +344,8 @@ def _cell9_texts(project) -> dict:
 
 def _stamp_text_pages(text_pdf: str, cfg: Config, volume_id: str, total: int,
                       page_forms: list | None = None,
-                      cell9_texts: dict | None = None) -> str:
+                      cell9_texts: dict | None = None,
+                      sheet_start: int | None = None) -> str:
     """Накладывает рамку и основную надпись на текстовые страницы.
 
     page_forms[i] определяет форму основной надписи для страницы i:
@@ -262,11 +355,14 @@ def _stamp_text_pages(text_pdf: str, cfg: Config, volume_id: str, total: int,
     Если page_forms не задан — первая страница FORM_TEXT_FIRST, остальные
     FORM_TEXT_NEXT.
 
+    :param sheet_start: первый номер листа сегмента (сквозная нумерация тома);
+        None — нумерация с 1 (полный текстовый блок «от начала»).
+
     Возвращает путь к новому PDF (или исходный при ошибке)."""
     import pymupdf
     doc = pymupdf.open(text_pdf)
     try:
-        sheet_no = 1
+        sheet_no = sheet_start if sheet_start else 1
         for i, pg in enumerate(doc):
             rect = pg.rect
             w_mm = rect.width / 2.8346
@@ -361,8 +457,17 @@ def _add_text_colontitules(text_pdf: str, cfg: Config, volume_id: str,
 
 def build_full_pdf(project: VolumeProject, out_path: str, cfg: Config | None = None,
                    use_word: bool = True, work_dir: str | None = None) -> str:
-    """Собирает полный том в единый PDF."""
+    """Собирает полный том в единый PDF.
+
+    Порядок сегментов берётся из project.structure (см. structure_segments):
+    соседние текстовые разделы склеиваются в один DOCX→PDF-сегмент, графика
+    и приложения идут своими сегментами. Сквозная нумерация считается по
+    toc.build_layout и прокидывается в квадраты номеров листов.
+    """
     import pymupdf
+    import logging
+
+    log = logging.getLogger("tom_builder.build")
     cfg = cfg or Config()
     # По умолчанию рабочий каталог — внутри проекта (tmp), т.к. системный temp
     # в некоторых средах недоступен для записи zip/DOCX.
@@ -373,76 +478,103 @@ def build_full_pdf(project: VolumeProject, out_path: str, cfg: Config | None = N
 
     total = compute_total_sheets(project)  # «Листов M»
     volume_id = project.requisites.volume_id
+    segments = structure_segments(project)
+    log.info("build_full_pdf: segments=%s total_sheets=%s",
+             [(k, list(kk)) for k, kk in segments], total)
 
-    # 1) текстовая часть (DOCX -> PDF через Word, если возможно)
-    text_pdf, from_word, page_forms = _text_pdf(project, cfg, work_dir, use_word)
+    # Начальный номер каждого сегмента — из единого источника toc.build_layout.
+    # Для сегмента, начинающегося «до» первой нумерованной позиции (обложка,
+    # титул), — 1.
+    seg_starts: list[int] = []
+    for _kind, kk in segments:
+        seg_starts.append(_segment_start_sheet(project, kk))
 
-    # 2) графические листы. Исходная графика сохраняется без изменений, поверх
-    # неё добавляется только квадрат со сквозным номером листа.
-    graphic_pdfs = []
-    g_index = 0
-    # Начальный номер листа графики = число НУМЕРОВАННЫХ страниц текстовой части + 1.
-    # Обложка и титульный лист не нумеруются (согласовано с содержанием toc), поэтому
-    # нельзя брать просто физический page_count: он включает обложку/титул.
-    sheet_counter = 1
-    if text_pdf and os.path.exists(text_pdf):
-        import pymupdf
-        with pymupdf.open(text_pdf) as t:
-            if page_forms is not None:
-                # fallback-путь: нумеруются только страницы с формой (не None).
-                sheet_counter = sum(1 for f in page_forms if f is not None) + 1
-            else:
-                # Word-путь: обложка/титул без номера, штампы внутри DOCX.
-                # Используем единый источник toc — последний номер листа перед
-                # графической частью.
-                from .toc import build_layout as _build_layout
-                lay = _build_layout(project)
-                pre_graphic = [it for it in lay.items
-                               if it.kind not in ("graphic", "appendix", "changes")]
-                sheet_counter = max((it.last_sheet for it in pre_graphic), default=0) + 1
-    graphic_docs = [d for d in project.documents_for(DocKind.GRAPHIC)]
-    for d in graphic_docs:
-        src = d.path
-        if not src or not os.path.exists(src):
-            continue
-        out = os.path.join(work_dir, f"_g{g_index}.pdf")
-        sheet_counter = _stamp_graphic_number_box(src, out, sheet_counter)
-        graphic_pdfs.append(out)
-        g_index += 1
-
-    # 3) приложения (PDF как есть, без рамки — самостоятельный документ)
-    appendix_pdfs = [a.file_path for a in project.appendices_needed()
-                     if a.file_path and os.path.exists(a.file_path)]
-
-    # 3.5) наложить рамку + осн. надпись (ф.5 / ф.6) на текстовые страницы.
-    # Только для PDF, собранного напрямую через PyMuPDF. Если текстовая часть
-    # пришла из Word (DOCX уже содержит рамку и осн. надпись) — не накладываем,
-    # чтобы не было двойного штампа.
-    if text_pdf and os.path.exists(text_pdf) and not from_word:
-        try:
-            text_pdf = _stamp_text_pages(text_pdf, cfg, volume_id, total, page_forms,
-                                         cell9_texts=_cell9_texts(project))
-        except Exception:
-            pass
-
-    # 4) слить всё в единый PDF в порядке: текст, графика, приложения
     merged = pymupdf.open()
-    if text_pdf and os.path.exists(text_pdf):
-        with pymupdf.open(text_pdf) as t:
-            merged.insert_pdf(t)
-    for gp in graphic_pdfs:
-        with pymupdf.open(gp) as g:
-            merged.insert_pdf(g)
-    for ap in appendix_pdfs:
-        with pymupdf.open(ap) as ap_:
-            merged.insert_pdf(ap_)
+    segment_files: list[str | None] = []   # путь PDF каждого сегмента
+    segment_meta: list[tuple] = []         # для диагностики/закладок
 
-    # 5) закладки по разделам
-    _add_bookmarks(merged, project, text_pdf is not None, len(graphic_pdfs), len(appendix_pdfs))
+    for idx, ((seg_kind, seg_kinds), start_sheet) in enumerate(zip(segments, seg_starts)):
+        if seg_kind == "text":
+            text_pdf, from_word, page_forms = _text_pdf(
+                project, cfg, work_dir, use_word, kinds=seg_kinds,
+                tag=f"seg{idx}")
+            log.info("segment[%d] text kinds=%s start=%s from_word=%s",
+                     idx, seg_kinds, start_sheet, from_word)
+            if text_pdf and os.path.exists(text_pdf) and not from_word:
+                # Наложение рамки/штампа — критично: без него PDF уходит
+                # без основных надписей. Ошибка пробрасывается наверх.
+                text_pdf = _stamp_text_pages(
+                    text_pdf, cfg, volume_id, total, page_forms,
+                    cell9_texts=_cell9_texts(project), sheet_start=start_sheet)
+            segment_files.append(text_pdf if text_pdf and os.path.exists(text_pdf) else None)
+            segment_meta.append(("text", seg_kinds, from_word))
+
+        elif seg_kind == "graphic":
+            graphic_pdfs = []
+            g_index = 0
+            sheet_counter = start_sheet
+            for d in project.documents_for(DocKind.GRAPHIC):
+                src = d.path
+                if not src or not os.path.exists(src):
+                    log.warning("graphic doc missing, skipped: %s", src)
+                    continue
+                out = os.path.join(work_dir, f"_g{idx}_{g_index}.pdf")
+                sheet_counter = _stamp_graphic_number_box(src, out, sheet_counter)
+                graphic_pdfs.append(out)
+                g_index += 1
+            # Склеиваем документы графики сегмента в один файл (или None)
+            if graphic_pdfs:
+                gseg = os.path.join(work_dir, f"_seg_graphic_{idx}.pdf")
+                gm = pymupdf.open()
+                for gp in graphic_pdfs:
+                    with pymupdf.open(gp) as g:
+                        gm.insert_pdf(g)
+                gm.save(gseg)
+                gm.close()
+                segment_files.append(gseg)
+            else:
+                segment_files.append(None)
+            log.info("segment[%d] graphic docs=%d start=%s",
+                     idx, g_index, start_sheet)
+            segment_meta.append(("graphic", seg_kinds, g_index))
+
+        elif seg_kind == "appendix":
+            appendix_pdfs = [a.file_path for a in project.appendices_needed()
+                             if a.file_path and os.path.exists(a.file_path)]
+            if appendix_pdfs:
+                aseg = os.path.join(work_dir, f"_seg_appendix_{idx}.pdf")
+                am = pymupdf.open()
+                for ap in appendix_pdfs:
+                    with pymupdf.open(ap) as ap_:
+                        am.insert_pdf(ap_)
+                am.save(aseg)
+                am.close()
+                segment_files.append(aseg)
+            else:
+                segment_files.append(None)
+            log.info("segment[%d] appendix files=%d", idx, len(appendix_pdfs))
+            segment_meta.append(("appendix", seg_kinds, len(appendix_pdfs)))
+
+    # ---- Склейка сегментов строго в порядке structure ----
+    for sf in segment_files:
+        if sf and os.path.exists(sf):
+            with pymupdf.open(sf) as part:
+                merged.insert_pdf(part)
+
+    if merged.page_count == 0:
+        pg = merged.new_page(width=595, height=842)
+        pg.insert_text((72, 100), "Том пуст — нет включённых разделов",
+                       fontname="helv", fontsize=11)
+
+    n_graphic = sum(n for k, _kk, n in segment_meta if k == "graphic")
+    n_appendix = sum(n for k, _kk, n in segment_meta if k == "appendix")
+    has_text = any(k == "text" for k, _kk, _n in segment_meta)
+    _add_bookmarks(merged, project, has_text, n_graphic, n_appendix)
 
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     merged.save(out_path)
     merged.close()
+    log.info("build_full_pdf: saved %s (%d pages)", out_path, total)
     return out_path
 
 
@@ -492,12 +624,10 @@ def build_section_pdf(project: VolumeProject, section_kind: str, out_path: str,
                 appendix_pdfs.append(a.file_path)
 
     # Наложить рамку/штамп на текстовые страницы (если собраны через PyMuPDF).
+    # Ошибка пробрасывается: PDF без основных надписей — не результат сборки.
     if text_pdf and os.path.exists(text_pdf) and not from_word:
-        try:
-            text_pdf = _stamp_text_pages(text_pdf, cfg, volume_id, total, page_forms,
-                                         cell9_texts=_cell9_texts(project))
-        except Exception:
-            pass
+        text_pdf = _stamp_text_pages(text_pdf, cfg, volume_id, total, page_forms,
+                                     cell9_texts=_cell9_texts(project))
 
     merged = pymupdf.open()
     if text_pdf and os.path.exists(text_pdf):

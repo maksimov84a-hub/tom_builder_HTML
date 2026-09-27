@@ -14,31 +14,45 @@ from ..models import DocKind
 def merge_pdfs(pdf_paths: list, out_path: str) -> int:
     """Объединяет PDF-файлы в один, сохраняя нативные размеры страниц.
 
-    Возвращает общее число страниц.
+    Возвращает фактическое общее число страниц результата.
+    Ошибка открытия входного файла пробрасывается с указанием пути.
     """
+    import logging
     import pymupdf
 
+    log = logging.getLogger("tom_builder.build")
     result = pymupdf.open()
     try:
         for p in pdf_paths:
-            with pymupdf.open(p) as doc:
-                result.insert_pdf(doc)
+            try:
+                with pymupdf.open(p) as doc:
+                    result.insert_pdf(doc)
+            except Exception as e:
+                raise RuntimeError(f"не удалось открыть PDF «{p}»: {e}") from e
+        page_count = result.page_count
         result.save(out_path)
+        return page_count
     finally:
         result.close()
-    return 0
 
 
 def count_pages(pdf_paths: list) -> int:
-    """Суммарное число страниц в наборе PDF."""
+    """Суммарное число страниц в наборе PDF.
+
+    Файлы, которые не удалось открыть, пропускаются с записью в лог
+    (причина не теряется молча).
+    """
+    import logging
     import pymupdf
+
+    log = logging.getLogger("tom_builder.build")
     total = 0
     for p in pdf_paths:
         try:
             with pymupdf.open(p) as doc:
                 total += doc.page_count
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("count_pages: не удалось прочитать «%s»: %s", p, e)
     return total
 
 

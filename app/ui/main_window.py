@@ -450,11 +450,47 @@ class MainWindow(QMainWindow):
         if not self._confirm_pending_pz_edits("собирать том"):
             return
         self._collect_forms()
+
+        # Preflight: ошибки блокируют сборку, warnings — с подтверждением.
+        try:
+            from ..core.preflight import run_preflight
+            pf = run_preflight(self.project)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось выполнить preflight:\n{e}")
+            return
+        if pf.errors:
+            QMessageBox.critical(
+                self, "Сборка отменена",
+                "Обнаружены ошибки — сборка тома не запущена:\n\n• "
+                + "\n• ".join(pf.errors))
+            return
+        if pf.warnings:
+            ans = QMessageBox.warning(
+                self, "Предупреждения",
+                "Предупреждения:\n\n• " + "\n• ".join(pf.warnings)
+                + "\n\nПродолжить сборку?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
+
         # Запрашиваем базовое имя файла; DOCX и PDF создаются рядом.
         base = QFileDialog.getSaveFileName(self, "Сохранить том", "том.docx",
                                            "Документ Word (*.docx)")[0]
         if not base:
             return
+
+        # Лог сборки — в tmp/build.log (причины ошибок не теряются).
+        log_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "tmp", "build.log")
+        import logging
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        logging.basicConfig(
+            filename=log_path, filemode="a", level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        log = logging.getLogger("tom_builder.build")
+        log.info("=== Сборка тома: %s ===", base)
+
         try:
             from ..config import load_config
             cfg = load_config()
@@ -464,22 +500,33 @@ class MainWindow(QMainWindow):
 
             from ..core.docx_exporter import build_text_docx
             build_text_docx(self.project, docx_out, cfg)
+            log.info("DOCX: %s", docx_out)
 
             full_pdf = None
+            pdf_error = None
             try:
                 from ..core.pdf_builder import build_full_pdf
                 full_pdf = build_full_pdf(self.project, pdf_out, cfg)
+                log.info("PDF: %s", full_pdf)
             except Exception as pe:
-                full_pdf = None
+                # Причина не теряется: лог + текст пользователю.
+                log.exception("build_full_pdf failed")
+                pdf_error = str(pe) or type(pe).__name__
 
             msg = f"Том собран в Word (DOCX):\n{docx_out}"
             if full_pdf:
                 msg += f"\n\nТом собран в PDF:\n{full_pdf}"
             else:
-                msg += "\n\nНе удалось собрать PDF."
+                msg += (f"\n\nНе удалось собрать PDF:\n{pdf_error}"
+                        f"\n\nПодробности: {log_path}")
+                QMessageBox.warning(self, "PDF не собран", msg)
+                return
             QMessageBox.information(self, "Готово", msg)
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось собрать том:\n{e}")
+            log.exception("build failed")
+            QMessageBox.critical(
+                self, "Ошибка",
+                f"Не удалось собрать том:\n{e}\n\nПодробности: {log_path}")
 
     def _on_build_section(self, info: dict) -> None:
         """Собрать выбранный раздел тома целиком (Word / PDF)."""
