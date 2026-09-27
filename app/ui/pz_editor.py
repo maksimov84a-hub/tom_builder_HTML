@@ -24,9 +24,13 @@ from PySide6.QtCore import Qt
 class PzEditorDialog(QDialog):
     """Постраничный редактор текста исходного DOCX пояснительной записки."""
 
-    def __init__(self, path: str, parent=None):
+    def __init__(self, path: str, parent=None, first_form=2):
         super().__init__(parent)
         self.path = path
+        # Форма штампа первого листа потока документа в разделе (2 / "2a") —
+        # по ней считается бюджет первого листа, чтобы разбивка редактора
+        # совпадала с предпросмотром (см. preview_html.pz_doc_first_form).
+        self.first_form = first_form
         self._document = None
         # Список индексов абзацев DOCX для каждого листа.
         self._pages: list[list[int]] = []
@@ -91,7 +95,8 @@ class PzEditorDialog(QDialog):
             content = read_docx(self.path)
             # Путь нужен для фактических ширин колонок таблиц — иначе листы в
             # редакторе не совпали бы с листами предпросмотра.
-            pages = _paginate_docx(content, self.path) or [[]]
+            pages = _paginate_docx(content, self.path,
+                                   first_form=self.first_form) or [[]]
 
             # Индексы непустых абзацев в порядке следования: именно они попадают
             # в поток пагинации (пустые абзацы алгоритм пропускает).

@@ -194,8 +194,12 @@ def _estimate_paragraph_h(text: str, size: int, fmt=None) -> float:
     if fmt is None:
         return height
     height *= fmt.line_height_factor()
+    # Интервалы заданы в ПУНКТАХ (Word/CSS: padding-top: Npt), а высота листа
+    # считается в миллиметрах: мм = пт / (пт в одном мм). PT_PER_MM = 72/25.4
+    # — это «пунктов в миллиметре», поэтому делим, а не умножаем (умножение
+    # давало ×8 и обрывало листы на середине — много пустого места внизу).
     height += (float(getattr(fmt, "space_before_pt", 0.0) or 0.0)
-               + float(getattr(fmt, "space_after_pt", 0.0) or 0.0)) * PT_PER_MM
+               + float(getattr(fmt, "space_after_pt", 0.0) or 0.0)) / PT_PER_MM
     return height
 
 
@@ -1239,7 +1243,7 @@ def _para_format(content, para_index: int):
         return None
 
 
-def _paginate_docx(content, path: str = "") -> list:
+def _paginate_docx(content, path: str = "", first_form=2) -> list:
     """Разбивает содержимое DOCX на «страницы» (списки строк/таблиц).
 
     Каждая страница — список элементов ("line", {...}) / ("table_rows", [row...]).
@@ -1247,6 +1251,13 @@ def _paginate_docx(content, path: str = "") -> list:
     число визуальных строк x высота строки, для строки таблицы — число строк
     самой высокой ячейки x высота строки ячейки. Бюджет считается консервативно
     (с запасом), чтобы контент не уходил под штамп и не обрезался overflow:hidden.
+
+    :param first_form: форма основной надписи ПЕРВОГО листа потока —
+        2 (форма 5, штамп 40 мм) или "2a" (форма 6, штамп 15 мм). Бюджет
+        первого листа берётся по ней; последующие листы всегда форма 6.
+        Если лист оглавления уже занял «первый лист» раздела (форма 5),
+        содержимое документа начинается с формы 6 — иначе ~25 мм низа
+        первого листа остаются бы пустыми.
 
     Высота абзаца учитывает оформление Word (app.core.pz_format): межстрочный
     интервал, абзацные отступы до/после и сужение колонки абзацными отступами,
@@ -1295,8 +1306,8 @@ def _paginate_docx(content, path: str = "") -> list:
     # Доступная высота текстовой области: лист A4 - верхнее поле - нижнее поле,
     # уменьшенные на высоту штампа (форма 5 — 40 мм, форма 6 — 15 мм) и зазор.
     # Запас 2 мм сверху/снизу (border/отступы), чтобы оценка не занижала объём.
-    first_budget = _page_text_height(FORM_HEIGHT[2])    # форма 5: штамп 40 мм
-    next_budget = _page_text_height(FORM_HEIGHT["2a"])  # форма 6: штамп 15 мм
+    first_budget = _page_text_height(FORM_HEIGHT[first_form])  # форма 5 или 6
+    next_budget = _page_text_height(FORM_HEIGHT["2a"])         # форма 6
     pages, cur, cur_h, budget = [], [], 0.0, first_budget
 
     def flush_page() -> None:
@@ -1624,12 +1635,12 @@ def _pz_toc_fragments(snapshot: dict, font_map: FontMap,
         else:
             sheet_no = i + 1
         num = _numbered_snapshot(snapshot, sheet_no, sheets_total)
-        # Номера листов в строках оглавления — сквозные по тому: сдвиг равен
-        # (номер ПЕРВОГО листа оглавления − 1) + число листов оглавления, т.е.
-        # номеру листа записки с локальным номером 1 минус 1. Сдвиг одинаков для
-        # всех листов оглавления, поэтому считается по номеру первого листа.
+        # Номера листов в строках оглавления — сквозные по тому: сдвиг считается
+        # по квадрату сквозной нумерации (square_no), а не по графе «Лист»
+        # штампа: в сборке тома графы «Лист/Листов» ведутся по разделу, а
+        # квадрат и оглавление остаются сквозными (согласованы с содержанием).
         try:
-            first_no = int(sheet_no) - i
+            first_no = int(num.get("square_no") or sheet_no) - i
         except (TypeError, ValueError):
             first_no = 1
         num["pz_toc_offset"] = max(0, first_no - 1) + len(pages)
@@ -1670,7 +1681,11 @@ def _docx_sheet_fragments(path: str, snapshot: dict, font_map: FontMap,
     except Exception:
         return toc_frags + [_sheet_fragment("doc", snapshot, font_map, counter=counter,
                                             sheets_total=sheets_total)]
-    pages = _paginate_docx(content, path)
+    pages = _paginate_docx(content, path,
+                           # Форма первого листа та же, что и у штампа ниже:
+                           # если лист оглавления уже занял форму 5, первая
+                           # страница содержимого несёт форму 6 (и бюджет 246 мм).
+                           first_form=(2 if first else "2a"))
     if max_pages is not None:
         pages = pages[:max_pages]
     # Несохранённые правки ячеек таблиц этого документа ({"т:с:я": текст}).
@@ -1698,7 +1713,8 @@ def _docx_sheet_fragments(path: str, snapshot: dict, font_map: FontMap,
             continued=continued[i] if i < len(continued) else None))
         # Отступ сверху с учётом квадрата сквозной нумерации (indent_top),
         # чтобы текст не заезжал под квадрат в правом верхнем углу.
-        frags.append(_wrap_sheet(body, stamp, sheet_no=num.get("sheet_no", ""),
+        frags.append(_wrap_sheet(body, stamp,
+                                 sheet_no=num.get("square_no", num.get("sheet_no", "")),
                                  indent_top=True))
     if not frags:
         frags = [_sheet_fragment("doc", snapshot, font_map, counter=counter,
@@ -1766,13 +1782,14 @@ def _pdf_sheet_fragments(path: str, snapshot: dict, font_map: FontMap,
             # сохранял родной размер и его рамка совмещалась с рамкой листа,
             # а квадрат номера — с верхним правым углом рамки чертежа.
             frags.append(_wrap_sheet(header + img, stamp, w_mm=w_mm, h_mm=h_mm,
-                                     data_pdf=(path, i), sheet_no=num.get("sheet_no", ""),
+                                     data_pdf=(path, i),
+                                     sheet_no=num.get("square_no", num.get("sheet_no", "")),
                                      no_frame=True, full_bleed=True))
         else:
             # Текстовые листы (ПЗ) и приложения: отступ сверху с учётом
             # квадрата сквозной нумерации, чтобы текст не заезжал под него.
             frags.append(_wrap_sheet(header + img, stamp,
-                                     sheet_no=num.get("sheet_no", ""),
+                                     sheet_no=num.get("square_no", num.get("sheet_no", "")),
                                      indent_top=True))
     return frags
 
@@ -1825,11 +1842,25 @@ class _SheetCounter:
 
 
 def _numbered_snapshot(snapshot: dict, sheet_no, sheets_total) -> dict:
-    """Копия snapshot с номером листа и общим числом листов раздела."""
+    """Копия snapshot с номером листа и общим числом листов раздела.
+
+    sheet_no / sheets_total — значения для граф «Лист» / «Листов» основной
+    надписи (формы 5/6): листы ТОЛЬКО этого раздела (части тома).
+
+    square_no — номер в квадрате сквозной нумерации (правый верхний угол).
+    В сборке тома в snapshot передаётся square_base (первый номер раздела
+    по toc.build_layout), поэтому квадрат остаётся сквозным по тому и
+    совпадает с содержанием; без base квадрат равен локальному номеру.
+    """
     s = dict(snapshot)
     s["sheet_no"] = str(sheet_no)
     if sheets_total is not None:
         s["sheets_total"] = str(sheets_total)
+    base = snapshot.get("square_base")
+    try:
+        s["square_no"] = str(int(base) + int(sheet_no) - 1)
+    except (TypeError, ValueError):
+        s["square_no"] = str(sheet_no) if sheet_no not in (None, "") else ""
     return s
 
 
@@ -1843,8 +1874,12 @@ def _pdf_count(path: str) -> int:
         return 1
 
 
-def _doc_sheet_count(d) -> int:
-    """Число листов одного документа (DOCX — пагинация, PDF — страницы)."""
+def _doc_sheet_count(d, first_form=2) -> int:
+    """Число листов одного документа (DOCX — пагинация, PDF — страницы).
+
+    :param first_form: форма штампа первого листа потока документа (2 или "2a")
+        — по ней считается бюджет первого листа (см. _paginate_docx).
+    """
     path = d.path
     if not path or not os.path.exists(path):
         return 1          # будет показан лист-заглушка
@@ -1854,10 +1889,55 @@ def _doc_sheet_count(d) -> int:
             # Путь передаётся обязательно: от него зависят фактические ширины
             # колонок таблиц, а значит и разбивка на листы. Иначе число листов
             # в содержании/штампе не совпало бы с предпросмотром.
-            return max(1, len(_paginate_docx(read_docx(path), path)))
+            return max(1, len(_paginate_docx(read_docx(path), path,
+                                             first_form=first_form)))
         except Exception:
             return max(1, int(getattr(d, "pages", 0) or 1))
     return _pdf_count(path)
+
+
+def pz_doc_first_forms(project) -> list:
+    """Форма первого листа содержимого каждого документа ПЗ в разделе.
+
+    Возвращает список [2 | "2a"] параллельно documents_for(PZ):
+    первый лист раздела несёт форму 5, только если перед ним НЕТ листов
+    оглавления; все остальные листы (листы оглавления уже заняли форму 5,
+    последующие документы) — форма 6. Единое правило для предпросмотра,
+    подсчёта листов и редактора ПЗ.
+    """
+    from ..models import DocKind
+    try:
+        docs = project.documents_for(DocKind.POYASNITELNAYA)
+    except Exception:
+        return []
+    if not docs:
+        return []
+    try:
+        from .pz_toc import project_toc_sheets
+        toc_sheets = project_toc_sheets(project)
+    except Exception:
+        toc_sheets = 0
+    return [2 if (i == 0 and toc_sheets == 0) else "2a"
+            for i in range(len(docs))]
+
+
+def pz_doc_first_form(project, path: str) -> int | str:
+    """Форма первого листа содержимого документа ПЗ по его пути (2 | "2a").
+
+    Для вызовов, которым известен только путь (редактор ПЗ, пересчёт числа
+    листов в дереве/свойствах): 2 — документ открывается первым листом
+    раздела без оглавления, "2a" — все остальные случаи (см. pz_doc_first_forms).
+    """
+    from ..models import DocKind
+    try:
+        docs = project.documents_for(DocKind.POYASNITELNAYA)
+        forms = pz_doc_first_forms(project)
+        for i, d in enumerate(docs):
+            if d.path and path and os.path.abspath(d.path) == os.path.abspath(path):
+                return forms[i] if i < len(forms) else 2
+    except Exception:
+        pass
+    return 2
 
 
 def _section_sheet_count(project, section_kind: str) -> int:
@@ -1877,11 +1957,17 @@ def _section_sheet_count(project, section_kind: str) -> int:
         return 1          # лист регистрации изменений формируется одним листом
     if section_kind == SECTION_PZ:
         # + листы автоматического оглавления записки (app.core.pz_toc).
+        # Форма первого листа каждого документа — как в предпросмотре.
         from .pz_toc import project_toc_sheets
+        docs = project.documents_for(DocKind.POYASNITELNAYA)
+        forms = pz_doc_first_forms(project)
         return (project_toc_sheets(project)
-                + sum(_doc_sheet_count(d) for d in project.documents_for(DocKind.POYASNITELNAYA)))
+                + sum(_doc_sheet_count(d, first_form=forms[i] if i < len(forms) else 2)
+                      for i, d in enumerate(docs)))
     if section_kind == SECTION_GRAPHIC:
-        return sum(_doc_sheet_count(d) for d in project.documents_for(DocKind.GRAPHIC))
+        # В разделе графики листы рисуются с формы 6 (first=False в дереве).
+        return sum(_doc_sheet_count(d, first_form="2a")
+                   for d in project.documents_for(DocKind.GRAPHIC))
     if section_kind == SECTION_APPENDIX:
         total = 0
         for a in project.appendices_needed():
@@ -1972,27 +2058,65 @@ def _sheet_fragment(kind: str, snapshot: dict, font_map: FontMap | None = None,
     # Отступ сверху с учётом квадрата сквозной нумерации (indent_top) —
     # для листов, на которых отображается номер (кроме обложки/титульного листа).
     _has_no = bool(num_snapshot.get("sheet_no"))
-    return _wrap_sheet(content, stamp, sheet_no=num_snapshot.get("sheet_no", ""),
+    return _wrap_sheet(content, stamp,
+                       sheet_no=num_snapshot.get("square_no",
+                                                 num_snapshot.get("sheet_no", "")),
                        indent_top=_has_no)
+
+
+def _section_square_base(project, section_kind: str) -> int | None:
+    """Первый сквозной номер раздела в томе (по toc.build_layout).
+
+    Используется для квадрата сквозной нумерации при сборке тома: квадрат
+    листа = base + локальный номер внутри раздела − 1, поэтому он совпадает
+    с содержанием, а графы «Лист/Листов» штампа остаются по разделу.
+    """
+    from ..models import (SECTION_COVER, SECTION_TITLE)
+    if section_kind in (SECTION_COVER, SECTION_TITLE):
+        return None          # обложка/титул не нумеруются
+    try:
+        from .toc import build_layout
+        for it in build_layout(project).items:
+            if it.section_key == section_kind and it.first_sheet >= 1:
+                return int(it.first_sheet)
+    except Exception:
+        return None
+    return None
 
 
 def _section_fragments(project, section_kind: str, snapshot: dict,
                        font_map: FontMap, counter: _SheetCounter | None = None,
-                       sheets_total: int | None = None) -> list:
+                       sheets_total: int | None = None,
+                       volume_numbered: bool = False) -> list:
     """Все листы раздела section_kind, включая многостраничные документы.
 
-    Нумерация листов (графы «Лист» и «Листов») ведётся сквозная по всему тому.
-    При standalone-сборке раздела счётчик локальный; обложка и титульный лист
-    не получают номер и не увеличивают счётчик.
+    Графы «Лист»/«Листов» форм 5/6 ведутся ПО РАЗДЕЛУ (части тома): счётчик
+    раздела стартует с 1, «Листов» = число листов раздела.
+
+    volume_numbered=True (сборка тома): в snapshot подставляется square_base —
+    первый сквозной номер раздела, поэтому квадрат сквозной нумерации и номера
+    строк оглавления ПЗ остаются сквозными по тому (как в содержании).
+    В раздельной сборке/предпросмотре раздела base не задаётся — квадрат
+    локальный. Обложка и титульный лист номер не получают и счётчик
+    не увеличивают.
     """
     from ..models import (SECTION_COVER, SECTION_TITLE, SECTION_CONTENT,
                           SECTION_PZ, SECTION_GRAPHIC, SECTION_APPENDIX,
                           SECTION_CHANGES, DocKind)
     frags = []
-    # Для standalone-раздела сохраняем локальную нумерацию; для тома
-    # вызывающий код передаёт единый счётчик и общее число листов.
-    counter = counter or _SheetCounter(1)
-    sheets_total = sheets_total if sheets_total is not None else _section_sheet_count(project, section_kind)
+    if volume_numbered:
+        # Том: локальный счётчик раздела + квадрат от сквозного base.
+        counter = _SheetCounter(1)
+        sheets_total = _section_sheet_count(project, section_kind)
+        base = _section_square_base(project, section_kind)
+        if base is not None:
+            snapshot = dict(snapshot)
+            snapshot["square_base"] = base
+    else:
+        # Standalone-раздел: локальная нумерация (или от вызывающего кода).
+        counter = counter or _SheetCounter(1)
+        sheets_total = (sheets_total if sheets_total is not None
+                        else _section_sheet_count(project, section_kind))
     if section_kind == SECTION_COVER:
         frags.append(_sheet_fragment("cover", snapshot, font_map,
                                      counter=counter, sheets_total=sheets_total))
@@ -2058,17 +2182,18 @@ def render_sheet_fragments(kind: str, snapshot: dict,
 
     Для стандартных листов (обложка/титул/содержание/изменения) и отдельных
     форм — один лист. Для раздела тома (ПЗ / графика / приложения) и для
-    многостраничного документа — все его листы подряд, с той же сквозной
-    нумерацией, что и при сборке тома.
+    многостраничного документа — все его листы подряд. Графы «Лист/Листов»
+    форм 5/6 считаются в пределах раздела (части тома); квадрат сквозной
+    нумерации в предпросмотре локальный для раздела.
     """
     from ..models import (SECTION_COVER, SECTION_TITLE, SECTION_CONTENT,
                           SECTION_PZ, SECTION_GRAPHIC, SECTION_APPENDIX,
-                          SECTION_CHANGES)
+                          SECTION_CHANGES, DocKind)
     font_map = font_map or FontMap()
 
     # Лист/документ с явно заданным путём — отдаём все листы этого документа.
     if kind in ("doc", "appendix"):
-        return _all_document_fragments(kind, snapshot, font_map)
+        return _all_document_fragments(kind, snapshot, font_map, project)
 
     # Раздел тома, для которого нужен полный набор листов.
     section = snapshot.get("section", "")
@@ -2079,20 +2204,101 @@ def render_sheet_fragments(kind: str, snapshot: dict,
     # Обложка/титул/содержание/изменения и отдельные формы ГОСТ — один лист.
     if kind in ("cover", "title", "content", "changes",
                 "stamp_f1", "stamp_f2", "stamp_f2a"):
+        # Содержание/изменения при известном project: «Лист 1 / Листов N»
+        # (листы только этого раздела); без project — как в снимке.
+        if kind in ("content", "changes") and project is not None:
+            sec_kind = (SECTION_CONTENT if kind == "content" else SECTION_CHANGES)
+            sub = dict(snapshot)
+            sub["sheet_no"] = "1"
+            sub["sheets_total"] = str(_section_sheet_count(project, sec_kind))
+            return [_sheet_fragment(kind, sub, font_map)]
         return [_sheet_fragment(kind, snapshot, font_map)]
 
     # Прочие документы/разделы — один лист (заглушка или первая страница).
     return [_sheet_fragment(kind, snapshot, font_map)]
 
 
-def _all_document_fragments(kind: str, snapshot: dict, font_map: FontMap) -> list:
-    """Все листы документа/приложения из снимка предпросмотра (path в snapshot)."""
+def _all_document_fragments(kind: str, snapshot: dict, font_map: FontMap,
+                             project=None) -> list:
+    """Все листы документа/приложения из снимка предпросмотра (path в snapshot).
+
+    Нумерация продолжает РАЗДЕЛ (часть тома), как и в предпросмотре раздела:
+    счётчик стартует со смещением — листами, стоящими перед этим документом
+    в разделе (для первого документа ПЗ смещение 0: листы оглавления входят
+    в его поток). «Листов» — общее число листов раздела.
+    """
+    from ..models import (SECTION_PZ, SECTION_GRAPHIC, SECTION_APPENDIX, DocKind)
     path = snapshot.get("path", "")
     if not path or not os.path.exists(path):
         return [_sheet_fragment(kind, snapshot, font_map)]
-    if kind == "appendix":
+    if project is None:
+        if kind == "appendix":
+            return _pdf_sheet_fragments(path, snapshot, font_map, first=True,
+                                        is_appendix=True)
+        if _is_docx(path):
+            return _docx_sheet_fragments(path, snapshot, font_map, first=True)
         return _pdf_sheet_fragments(path, snapshot, font_map, first=True,
-                                    is_appendix=True)
+                                    is_appendix=False)
+
+    def _find(docs, attr="path") -> int | None:
+        return next((i for i, d in enumerate(docs)
+                     if getattr(d, attr, "") and path
+                     and os.path.abspath(getattr(d, attr)) == os.path.abspath(path)),
+                    None)
+
+    # --- Приложение: продолжение нумерации раздела приложений ---
+    if kind == "appendix":
+        from .toc import appendix_sheet_count
+        apps = project.appendices_needed()
+        idx = _find(apps, "file_path")
+        counter = None
+        if idx is not None:
+            offset = sum(appendix_sheet_count(a) for a in apps[:idx])
+            counter = _SheetCounter(offset + 1)
+        return _pdf_sheet_fragments(path, snapshot, font_map, first=True,
+                                    is_appendix=True, counter=counter,
+                                    sheets_total=_section_sheet_count(
+                                        project, SECTION_APPENDIX))
+
+    # --- Документ ПЗ: сдвиг и форма первого листа — как в разделе ---
+    docs = project.documents_for(DocKind.POYASNITELNAYA)
+    idx = _find(docs)
+    if idx is not None:
+        forms = pz_doc_first_forms(project)
+        offset = sum(_doc_sheet_count(d, first_form=forms[i] if i < len(forms) else 2)
+                     for i, d in enumerate(docs[:idx]))
+        if idx > 0:
+            # Оглавление стоит перед ПЕРВЫМ документом — для последующих
+            # документов оно тоже входит в число предшествующих листов.
+            try:
+                from .pz_toc import project_toc_sheets
+                offset += project_toc_sheets(project)
+            except Exception:
+                pass
+        counter = _SheetCounter(offset + 1)
+        sheets_total = _section_sheet_count(project, SECTION_PZ)
+        # Показ документа совпадает с показом раздела: оглавление и
+        # форма 5 — только у ПЕРВОГО листа раздела.
+        doc_first = (idx == 0)
+        if _is_docx(path):
+            return _docx_sheet_fragments(path, snapshot, font_map, first=doc_first,
+                                         counter=counter, sheets_total=sheets_total)
+        return _pdf_sheet_fragments(path, snapshot, font_map, first=doc_first,
+                                    is_appendix=False, counter=counter,
+                                    sheets_total=sheets_total)
+
+    # --- Документ графической части: квадрат продолжает раздел ---
+    gdocs = project.documents_for(DocKind.GRAPHIC)
+    gidx = _find(gdocs)
+    if gidx is not None:
+        offset = sum(_doc_sheet_count(d, first_form="2a") for d in gdocs[:gidx])
+        counter = _SheetCounter(offset + 1)
+        return _pdf_sheet_fragments(path, snapshot, font_map, first=False,
+                                    is_appendix=False, counter=counter,
+                                    sheets_total=_section_sheet_count(
+                                        project, SECTION_GRAPHIC))
+
+    # --- Прочее (вне структуры) — прежнее поведение ---
     if _is_docx(path):
         return _docx_sheet_fragments(path, snapshot, font_map, first=True)
     return _pdf_sheet_fragments(path, snapshot, font_map, first=True,
@@ -2314,19 +2520,16 @@ def build_volume_html(project, out_path: str, font_map: FontMap | None = None) -
     font_map = font_map or FontMap()
     snapshot = build_preview_snapshot(project)
     fragments = []
-    # Один счётчик на весь том: обложка и титульный лист его не расходуют.
-    counter = _SheetCounter(1)
-    sheets_total = sum(_section_sheet_count(project, e.get("kind"))
-                       for e in project.structure if e.get("needed", True)
-                       and e.get("kind") not in ("cover", "title"))
-    # Обходим структуру тома и для каждого раздела добавляем ВСЕ его листы
-    # (включая многостраничные документы и приложения).
+    # Обходим структуру тома: каждый раздел нумеруется отдельно (графы
+    # «Лист/Листов» форм 5/6 — листы только этого раздела). Квадрат
+    # сквозной нумерации считается внутри раздела от square_base (см.
+    # _section_fragments / volume_numbered).
     for entry in project.structure:
         if not entry.get("needed", True):
             continue
         kind = entry.get("kind")
         fragments.extend(_section_fragments(project, kind, snapshot, font_map,
-                                            counter=counter, sheets_total=sheets_total))
+                                            volume_numbered=True))
     title = project.requisites.volume_name or project.name or "Том"
     html = _html_document(fragments, title)
 

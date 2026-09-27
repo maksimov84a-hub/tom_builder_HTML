@@ -116,6 +116,9 @@ class DocInfoWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._doc = None
+        # Проект нужен для расчёта формы первого листа документа (pz_doc_first_form);
+        # проставляется контекстной панелью при загрузке проекта/показе формы.
+        self.project = None
         v = QVBoxLayout(self)
         grp = QGroupBox("Документ")
         f = QFormLayout(grp)
@@ -176,13 +179,17 @@ class DocInfoWidget(QWidget):
                 "Редактирование доступно только для исходного документа Word (DOCX).")
             return
         from .pz_editor import PzEditorDialog
-        dlg = PzEditorDialog(path, self)
+        from ..core.preview_html import pz_doc_first_form
+        dlg = PzEditorDialog(path, self,
+                             first_form=pz_doc_first_form(self.project, path))
         if dlg.exec() == QDialog.Accepted:
             # Число листов могло измениться — пересчитываем и обновляем предпросмотр.
             # Используется та же пагинация, что и в предпросмотре/сборке.
             try:
                 from ..core.preview_html import _doc_sheet_count
-                self._doc.pages = max(1, _doc_sheet_count(self._doc))
+                self._doc.pages = max(1, _doc_sheet_count(
+                    self._doc,
+                    first_form=pz_doc_first_form(self.project, path)))
                 self.lbl_pages.setText(str(self._doc.pages))
             except Exception:
                 pass
@@ -321,6 +328,7 @@ class ContextPanel(QWidget):
         self.changes = ChangesForm(get_signers=lambda: self.signers_form.get_signers())
         self.appendices = AppendicesForm()
         self.doc_info = DocInfoWidget()
+        self.doc_info.project = project
         self.doc_info.changed.connect(self.item_modified)
         self.appendix_info = AppendixInfoWidget()
         self.appendix_info.changed.connect(self.item_modified)
@@ -339,6 +347,7 @@ class ContextPanel(QWidget):
     # ---- Загрузка / сбор данных ----
     def load_project(self, project: VolumeProject) -> None:
         self.project = project
+        self.doc_info.project = project
         self.requisites.load(project.requisites, getattr(project, "stamp_cell9", None))
         self.cover_title._load()
         self.changes.set_records(project.changes)
@@ -375,6 +384,7 @@ class ContextPanel(QWidget):
             self.appendix_info.load(selection)
             self.stack.setCurrentWidget(self.appendix_info)
         elif kind == "doc":
+            self.doc_info.project = self.project
             self.doc_info.load(selection)
             self.stack.setCurrentWidget(self.doc_info)
         else:

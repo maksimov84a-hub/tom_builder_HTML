@@ -104,12 +104,15 @@ def _paginate_docx(content) -> list:
     return pages
 
 
-def doc_sheet_count(d) -> int:
+def doc_sheet_count(d, first_form=2) -> int:
     """Число листов одного документа (DOCX — пагинация, PDF — страницы).
 
     Единый источник подсчёта — preview_html._doc_sheet_count (та же пагинация,
     что и в предпросмотре). Это гарантирует, что число листов в содержании
     совпадает с тем, что пользователь видит в предпросмотре листа.
+
+    :param first_form: форма штампа первого листа потока документа
+        (2 — форма 5, "2a" — форма 6; влияет на бюджет первого листа).
 
     Если файл недоступен — используется заявленное число листов d.pages
     (минимум 1), т.к. лист-заглушка всё равно занимает место.
@@ -121,7 +124,7 @@ def doc_sheet_count(d) -> int:
         # Ленивый импорт, чтобы избежать жёсткого цикла (preview_html не
         # импортирует toc на верхнем уровне).
         from .preview_html import _doc_sheet_count as _pv_doc_sheet
-        return max(1, _pv_doc_sheet(d))
+        return max(1, _pv_doc_sheet(d, first_form=first_form))
     except Exception:
         pass
     if _is_docx(path):
@@ -280,8 +283,16 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
             # Автоматическое оглавление записки (app.core.pz_toc) занимает свои
             # листы ПЕРЕД первым документом раздела и также входит в «Листов M».
             toc_sheets = _pz_toc_sheets(project)
+            # Форма первого листа каждого документа — как в предпросмотре
+            # (preview_html.pz_doc_first_forms): сказывается на разбивке DOCX.
+            try:
+                from .preview_html import pz_doc_first_forms
+                forms = pz_doc_first_forms(project)
+            except Exception:
+                forms = []
             for index, d in enumerate(docs):
-                n = doc_sheet_count(d) + (toc_sheets if index == 0 else 0)
+                ff = forms[index] if index < len(forms) else 2
+                n = doc_sheet_count(d, first_form=ff) + (toc_sheets if index == 0 else 0)
                 layout.items.append(ContentItem(
                     title=doc_label(d), designation=volume_id,
                     first_sheet=sheet, last_sheet=sheet + n - 1, count=n,
@@ -298,7 +309,9 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
                 sheet += 1
                 continue
             for d in docs:
-                n = doc_sheet_count(d)
+                # В разделе графики первый лист документа тоже рисуется
+                # с формы 6 (first=False в дереве) — та же модель высот.
+                n = doc_sheet_count(d, first_form="2a")
                 layout.items.append(ContentItem(
                     title=doc_label(d), designation=volume_id,
                     first_sheet=sheet, last_sheet=sheet + n - 1, count=n,

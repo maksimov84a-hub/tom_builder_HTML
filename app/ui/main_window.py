@@ -660,7 +660,7 @@ class MainWindow(QMainWindow):
             from ..models import DocKind
             for d in self.project.documents:
                 if d.doc_kind == DocKind.POYASNITELNAYA:
-                    self._refresh_doc_pages(d)
+                    self._refresh_doc_pages(d, self.project)
             self.sheet_tree.set_project(self.project)
             QMessageBox.information(
                 self, "Сохранено",
@@ -706,15 +706,17 @@ class MainWindow(QMainWindow):
                 "Добавьте документ в разделе или выберите DOCX в дереве «Листы тома».")
             return
         from .pz_editor import PzEditorDialog
-        dlg = PzEditorDialog(doc.path, self)
+        from ..core.preview_html import pz_doc_first_form
+        dlg = PzEditorDialog(doc.path, self,
+                             first_form=pz_doc_first_form(self.project, doc.path))
         if dlg.exec() == QDialog.Accepted:
             # Текст изменился — пересчитываем листы и обновляем предпросмотр и дерево.
-            self._refresh_doc_pages(doc)
+            self._refresh_doc_pages(doc, self.project)
             self._refresh_preview()
             self.sheet_tree.set_project(self.project)
 
     @staticmethod
-    def _refresh_doc_pages(doc) -> None:
+    def _refresh_doc_pages(doc, project=None) -> None:
         """Пересчитывает число листов документа той же пагинацией, что и сборка.
 
         В дереве и в свойствах показывается именно то число листов, которое
@@ -724,8 +726,9 @@ class MainWindow(QMainWindow):
         if not path or not os.path.exists(path):
             return
         try:
-            from ..core.preview_html import _doc_sheet_count
-            doc.pages = max(1, _doc_sheet_count(doc))
+            from ..core.preview_html import _doc_sheet_count, pz_doc_first_form
+            first_form = 2 if project is None else pz_doc_first_form(project, path)
+            doc.pages = max(1, _doc_sheet_count(doc, first_form=first_form))
         except Exception:
             pass
 
