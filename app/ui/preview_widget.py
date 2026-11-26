@@ -18,8 +18,8 @@ from __future__ import annotations
 import os
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QProgressBar,
-    QStackedLayout,
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QProgressBar, QStackedLayout,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
@@ -28,6 +28,7 @@ from PySide6.QtCore import QUrl, QTimer, Signal, Qt
 from ..core.preview_html import (render_sheet, render_sheet_fragments,
                                  render_preview_error)
 from .preview_bridge import PreviewBridge
+from .word_host import WordHost
 
 ZOOM_STEP = 0.1
 #: Пауза после остановки ввода, через которую правка ПЗ пишется в DOCX.
@@ -122,7 +123,7 @@ class SheetPreview(QWidget):
         self.btn_save_pz.setVisible(False)
         self.btn_repaginate = QPushButton("Пересчитать страницы")
         self.btn_repaginate.setVisible(False)
-        self.btn_repaginate.clicked.connect(lambda: self.repaginate_requested.emit())
+        self.btn_repaginate.clicked.connect(self._on_repaginate_clicked)
         # Индикатор числа листов в предпросмотре (документ ПЗ показывается
         # целиком, несколькими листами подряд).
         self.lbl_sheets = QLabel("Листов: 1")
@@ -143,6 +144,16 @@ class SheetPreview(QWidget):
         self.preview_stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
         self.view = QWebEngineView()
         self.preview_stack.addWidget(self.view)
+        # Листы пояснительной записки показываются настоящим Word: файл уже
+        # собран с оглавлением и номерами листов (см. core.word_preview).
+        self.word_host = WordHost()
+        self.preview_stack.addWidget(self.word_host)
+        self.word_host.hide()
+        self._word_mode = False
+        self._word_path = ""
+        #: Проект текущего показа — нужен кнопке «Пересобрать листы».
+        self._project = None
+        self._word_error = ""
         self.progress_overlay = QWidget()
         self.progress_overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.progress_overlay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -233,6 +244,7 @@ class SheetPreview(QWidget):
                            == snapshot.get("path"))
         self._pending_kind = kind
         self._pending_snapshot = dict(snapshot)
+        self._project = project
         self.btn_repaginate.setVisible(snapshot.get("section") == "Пояснительная записка")
         self.btn_repaginate.setEnabled(not bool(snapshot.get("pagination_busy")))
         self.btn_repaginate.setText("Пересчёт…" if snapshot.get("pagination_busy") else
@@ -245,6 +257,11 @@ class SheetPreview(QWidget):
                                        "Пересчитать разбиение DOCX средствами Word")
         self._pending_snapshot["pz_edits"] = self.pz_pending_edits()
         self._pending_snapshot["pz_cell_edits"] = self.pz_pending_cell_edits()
+        # Пояснительная записка показывается НАСТОЯЩИМ Word: файл собран тем же
+        # кодом, что и раздел, — в нём уже есть оглавление с номерами листов.
+        if self._show_word_preview(kind, snapshot, project):
+            return
+        self._leave_word_mode()
         # Графическая часть: вписываем в окно первый лист — перечень листов.
         # Чертежи (A1/A2) в разы больше, и масштаб по самому большому листу
         # делал перечень нечитаемо мелким.
@@ -256,6 +273,155 @@ class SheetPreview(QWidget):
         self.view.setHtml(html, QUrl("about:blank"))
         # Панель внизу окна показывает и правит основную надпись активного листа.
         self.stamps_changed.emit(list(self._stamps), self._signer_registry)
+
+    def _on_repaginate_clicked(self) -> None:
+        """Кнопка справа от предпросмотра.
+
+        В режиме Word (пояснительная записка) она пересобирает документ с
+        оглавлением и номерами листов; в HTML-режиме — пересчитывает разбиение
+        средствами Word, как раньше.
+        """
+        if self._word_mode:
+            self.rebuild_word_preview(self._project)
+            return
+        self.repaginate_requested.emit()
+
+    def _show_word_preview(self, kind: str, snapshot: dict, project=None) -> bool:
+        """Показывает листы ПЗ во встроенном Word. True — режим Word включён.
+
+        Файл для Word — рабочая копия раздела ПЗ (core.word_preview): она
+        собрана штатным кодом раздела, поэтому в ней уже есть автоматическое
+        оглавление с номерами листов и основные надписи. Правки в Word
+        остаются в этой копии и не меняют исходный DOCX.
+
+        Пересборка — ТОЛЬКО по кнопке «Пересобрать листы»: если настройки
+        изменились, документ помечается устаревшим, но не пересобирается сам —
+        иначе несохранённые правки в Word пропадали бы без предупреждения.
+
+        Word недоступен (не установлен, сбой COM) — возвращаем False, и
+        предпросмотр откатывается на прежнюю HTML-вёрстку.
+        """
+        from ..models import SECTION_PZ
+        if snapshot.get("section") != SECTION_PZ:
+            return False
+        if kind not in ("doc", "section"):
+            return False
+        if project is None:
+            return False
+        try:
+            from ..core.word_preview import (current_preview_path,
+                                             build_preview_docx, is_stale)
+        except Exception:
+            return False
+        path = current_preview_path(project, SECTION_PZ)
+        if not path:
+            # Первый показ: документа ещё нет, собираем.
+            self.progress_title.setText("Подготовка листов ПЗ")
+            self.progress_message.setText(
+                "Собираю документ с оглавлением и номерами листов…")
+            self.progress_overlay.setVisible(True)
+            self.progress_overlay.raise_()
+            QApplication.processEvents()
+            try:
+                path = build_preview_docx(project, SECTION_PZ)
+            except Exception as e:
+                self._word_error = (f"Не удалось собрать документ ПЗ: "
+                                    f"{type(e).__name__}: {e}")
+                return False
+            finally:
+                self.progress_overlay.setVisible(False)
+        self._word_path = path
+        if not self.word_host.is_open() or self.word_host.current_path() != os.path.abspath(path):
+            # Прежний документ закрываем сами и без диалогов: если файл открыт,
+            # Word показал бы «Файл уже используется».
+            self.word_host.close_document(save=True)
+            if not self.word_host.open_document(path):
+                self._word_error = self.word_host.message()
+                return False
+        self._enter_word_mode()
+        stale = False
+        try:
+            stale = bool(is_stale(project, SECTION_PZ))
+        except Exception:
+            stale = False
+        self._set_word_stale(stale)
+        self.lbl_sheets.setText(
+            "Лист Word" + (" · требует пересборки" if stale else ""))
+        return True
+
+    def _set_word_stale(self, stale: bool) -> None:
+        """Помечает кнопку пересборки, когда документ отстал от настроек."""
+        self.btn_repaginate.setText("Пересобрать листы")
+        self.btn_repaginate.setStyleSheet(
+            "QPushButton { background:#f59e0b; color:#1f2937; font-weight:600; }"
+            if stale else "")
+        self.btn_repaginate.setToolTip(
+            ("Настройки изменились — документ собран раньше. " if stale else "")
+            + "Собрать документ ПЗ заново, с оглавлением и номерами листов. "
+              "Несохранённые правки в Word будут сохранены в рабочую копию.")
+
+    def _enter_word_mode(self) -> None:
+        """Переключает предпросмотр на окно Word (скрывает HTML-вид)."""
+        self._word_mode = True
+        self.view.hide()
+        self.word_host.show()
+        self.word_host.raise_()
+        # Масштаб и «вписать в окно» относятся к HTML-листу: в Word их роль
+        # выполняет сам Word (масштаб — в его строке состояния).
+        for widget in (self.btn_zoom_out, self.btn_zoom_in, self.btn_100,
+                       self.btn_fit, self.lbl_zoom):
+            widget.setVisible(False)
+        self.btn_repaginate.setVisible(True)
+        self.btn_repaginate.setText("Пересобрать листы")
+        self.btn_repaginate.setToolTip(
+            "Собрать документ ПЗ заново — с оглавлением и номерами листов. "
+            "Несохранённые правки в Word будут потеряны.")
+
+    def _leave_word_mode(self) -> None:
+        """Возвращает HTML-предпросмотр (другие листы тома)."""
+        if not self._word_mode:
+            return
+        self._word_mode = False
+        self.word_host.hide()
+        self.view.show()
+        for widget in (self.btn_zoom_out, self.btn_zoom_in, self.btn_100,
+                       self.btn_fit, self.lbl_zoom):
+            widget.setVisible(True)
+
+    def rebuild_word_preview(self, project=None) -> bool:
+        """Пересобирает рабочую копию и переоткрывает её в Word.
+
+        Вызывается кнопкой «Пересобрать листы»: правки в Word сначала
+        сохраняются в рабочую копию, затем файл собирается заново — уже с
+        оглавлением и номерами листов по текущим настройкам.
+        """
+        from ..models import SECTION_PZ
+        project = project or self._project
+        if project is None or not self._word_mode:
+            return False
+        self.word_host.close_document(save=True)
+        self.progress_title.setText("Пересборка листов ПЗ")
+        self.progress_message.setText(
+            "Собираю документ заново — с оглавлением и номерами листов…")
+        self.progress_overlay.setVisible(True)
+        self.progress_overlay.raise_()
+        QApplication.processEvents()
+        try:
+            from ..core.word_preview import build_preview_docx
+            path = build_preview_docx(project, SECTION_PZ, force=True)
+        except Exception as e:
+            self.progress_overlay.setVisible(False)
+            self.word_host._show_error(
+                f"Не удалось пересобрать: {type(e).__name__}: {e}")
+            return False
+        finally:
+            self.progress_overlay.setVisible(False)
+        self._word_path = path
+        opened = self.word_host.open_document(path)
+        self._set_word_stale(not opened)
+        if opened:
+            self.lbl_sheets.setText("Лист Word")
+        return opened
 
     def _build_html(self, kind: str, snapshot: dict, project=None):
         """Собирает HTML предпросмотра. Возвращает (html, число листов)."""
@@ -301,6 +467,12 @@ class SheetPreview(QWidget):
     def set_pagination_state(self, *, stale: bool, busy: bool, error: str = "",
                              message: str = "") -> None:
         self.btn_repaginate.setEnabled(not busy)
+        if self._word_mode:
+            # В режиме Word кнопка пересобирает документ, а не пересчитывает
+            # HTML-разбиение: текст «Пересчёт…» и индикатор здесь не нужны.
+            self._set_word_stale(bool(stale))
+            self.progress_overlay.setVisible(False)
+            return
         self.btn_repaginate.setText("Пересчёт…" if busy else "Пересчитать страницы")
         self.btn_repaginate.setStyleSheet(
             "QPushButton { background:#f59e0b; color:#1f2937; font-weight:600; }"
@@ -478,3 +650,15 @@ class SheetPreview(QWidget):
             self._pz_edits.pop(path, None)
             self._pz_cell_edits.pop(path, None)
         self._update_save_button()
+
+    def closeEvent(self, event) -> None:
+        """Закрывает встроенный Word вместе с предпросмотром.
+
+        Иначе процесс WINWORD остаётся в памяти с окном, встроенным в уже
+        уничтоженный виджет.
+        """
+        try:
+            self.word_host.close_document()
+        except Exception:
+            pass
+        super().closeEvent(event)

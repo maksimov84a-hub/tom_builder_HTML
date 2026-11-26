@@ -208,10 +208,22 @@ class MainWindow(QMainWindow):
         return True
 
     def closeEvent(self, event) -> None:
-        """Не даём потерять правки ПЗ, сделанные в предпросмотре."""
+        """Не даём потерять правки ПЗ и убираем рабочую копию предпросмотра."""
         if not self._confirm_pending_pz_edits("закрыть программу"):
             event.ignore()
             return
+        # Встроенный Word держит рабочую копию открытой: закрываем его и
+        # удаляем временные файлы предпросмотра.
+        try:
+            self.preview.word_host.close_document(save=True)
+        except Exception:
+            pass
+        try:
+            if not self.preview.has_pz_edits():
+                from ..core.word_preview import drop_preview
+                drop_preview(self.project)
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # ---- Главное меню ----
