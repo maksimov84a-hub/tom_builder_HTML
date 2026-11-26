@@ -3,96 +3,83 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QFormLayout, QGroupBox, QCheckBox, QLineEdit,
-    QPushButton, QFileDialog, QLabel, QHBoxLayout,
+    QWidget, QVBoxLayout, QFormLayout, QGroupBox, QCheckBox, QPushButton,
 )
 from ..models import CoverSheet, TitleSheet
+from .common import FileRow
+
+TEMPLATE_FILTERS = ("Документы (*.docx *.doc *.pdf);;"
+                    "Изображения (*.png *.jpg);;Все файлы (*)")
+_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
+
+
+class _TemplateGroup(QGroupBox):
+    """Лист тома: авто по ГОСТ либо кастомный шаблон."""
+
+    def __init__(self, title: str, auto_text: str, dialog_title: str, parent=None):
+        super().__init__(title, parent)
+        form = QFormLayout(self)
+        self.auto = QCheckBox(auto_text)
+        self.auto.toggled.connect(lambda checked: self.template.setEnabled(not checked))
+        self.template = FileRow(dialog_title, TEMPLATE_FILTERS,
+                                button_text="Выбрать шаблон…")
+        form.addRow(self.auto)
+        form.addRow("Шаблон:", self.template)
+        self.toggle()
+
+    def toggle(self) -> None:
+        self.template.setEnabled(not self.auto.isChecked())
+
+    def load(self, sheet) -> None:
+        self.auto.setChecked(not sheet.use_custom)
+        self.template.set_path(sheet.template_path)
+        self.toggle()
+
+    def apply(self, sheet) -> None:
+        sheet.use_custom = not self.auto.isChecked()
+        sheet.template_path = self.template.path()
+        sheet.is_image = sheet.template_path.lower().endswith(_IMAGE_EXTENSIONS)
 
 
 class CoverTitleForm(QWidget):
-    """Форма настройки обложки и титульного листа."""
+    """Форма настройки обложки и титульного листа.
 
-    def __init__(self, parent=None, cover: CoverSheet | None = None, title: TitleSheet | None = None):
+    Группа показывается только та, что относится к выбранному листу дерева:
+    на «Обложке» — настройки обложки, на «Титульном листе» — настройки титула.
+    """
+
+    def __init__(self, parent=None, cover: CoverSheet | None = None,
+                 title: TitleSheet | None = None):
         super().__init__(parent)
         self._cover = cover or CoverSheet()
         self._title = title or TitleSheet()
         v = QVBoxLayout(self)
-
-        # --- Обложка ---
-        g_cover = QGroupBox("Обложка (приложение Е ГОСТ Р 21.101-2020)")
-        cf = QFormLayout(g_cover)
-        self.cover_auto = QCheckBox("Формировать обложку автоматически по ГОСТ")
-        self.cover_auto.toggled.connect(self._toggle_cover)
-        self.cover_logo = QCheckBox("Показывать логотип организации")
-        self.cover_custom_path = QLineEdit()
-        self.cover_custom_path.setReadOnly(True)
-        btn_cover = QPushButton("Выбрать шаблон...")
-        btn_cover.clicked.connect(self._pick_cover)
-        cover_row = QHBoxLayout()
-        cover_row.addWidget(self.cover_custom_path); cover_row.addWidget(btn_cover)
-        cf.addRow(self.cover_auto)
-        cf.addRow(self.cover_logo)
-        cf.addRow("Шаблон:", cover_row)
-        v.addWidget(g_cover)
-
-        # --- Титульный лист ---
-        g_title = QGroupBox("Титульный лист (приложение Ж ГОСТ Р 21.101-2020)")
-        tf = QFormLayout(g_title)
-        self.title_auto = QCheckBox("Формировать титульный лист автоматически по ГОСТ")
-        self.title_auto.toggled.connect(self._toggle_title)
-        self.title_custom_path = QLineEdit()
-        self.title_custom_path.setReadOnly(True)
-        btn_title = QPushButton("Выбрать шаблон...")
-        btn_title.clicked.connect(self._pick_title)
-        title_row = QHBoxLayout()
-        title_row.addWidget(self.title_custom_path); title_row.addWidget(btn_title)
-        tf.addRow(self.title_auto)
-        tf.addRow("Шаблон:", title_row)
-        v.addWidget(g_title)
-
+        self.cover_group = _TemplateGroup(
+            "Обложка (приложение Е ГОСТ Р 21.101-2020)",
+            "Формировать обложку автоматически по ГОСТ",
+            "Шаблон обложки")
+        self.title_group = _TemplateGroup(
+            "Титульный лист (приложение Ж ГОСТ Р 21.101-2020)",
+            "Формировать титульный лист автоматически по ГОСТ",
+            "Шаблон титульного листа")
+        v.addWidget(self.cover_group)
+        v.addWidget(self.title_group)
         v.addStretch(1)
-
-        # Загрузить текущие значения
         self._load()
+        self.show_part("cover")
 
-    def _toggle_cover(self, checked: bool) -> None:
-        self.cover_custom_path.setEnabled(not checked)
-
-    def _toggle_title(self, checked: bool) -> None:
-        self.title_custom_path.setEnabled(not checked)
-
-    def _pick_cover(self) -> None:
-        f, _ = QFileDialog.getOpenFileName(self, "Шаблон обложки", "",
-                                           "Документы (*.docx *.doc *.pdf);;Изображения (*.png *.jpg);;Все файлы (*)")
-        if f:
-            self.cover_custom_path.setText(f)
-
-    def _pick_title(self) -> None:
-        f, _ = QFileDialog.getOpenFileName(self, "Шаблон титульного листа", "",
-                                           "Документы (*.docx *.doc *.pdf);;Изображения (*.png *.jpg);;Все файлы (*)")
-        if f:
-            self.title_custom_path.setText(f)
+    def show_part(self, kind: str) -> None:
+        """Показывает настройки одного листа: 'cover' либо 'title'."""
+        is_title = kind == "title"
+        self.cover_group.setVisible(not is_title)
+        self.title_group.setVisible(is_title)
 
     def _load(self) -> None:
-        self.cover_auto.setChecked(not self._cover.use_custom)
-        self.cover_logo.setChecked(self._cover.show_logo)
-        self.cover_custom_path.setText(self._cover.template_path)
-        self.title_auto.setChecked(not self._title.use_custom)
-        self.title_custom_path.setText(self._title.template_path)
-        self._toggle_cover(self.cover_auto.isChecked())
-        self._toggle_title(self.title_auto.isChecked())
+        self.cover_group.load(self._cover)
+        self.title_group.load(self._title)
 
     def apply_cover(self, cover: CoverSheet) -> None:
-        cover.use_custom = not self.cover_auto.isChecked()
-        cover.show_logo = self.cover_logo.isChecked()
-        cover.template_path = self.cover_custom_path.text().strip()
-        if cover.template_path:
-            ext = cover.template_path.lower()
-            cover.is_image = ext in (".png", ".jpg", ".jpeg", ".bmp")
+        self.cover_group.apply(cover)
 
     def apply_title(self, title: TitleSheet) -> None:
-        title.use_custom = not self.title_auto.isChecked()
-        title.template_path = self.title_custom_path.text().strip()
-        if title.template_path:
-            ext = title.template_path.lower()
-            title.is_image = ext in (".png", ".jpg", ".jpeg", ".bmp")
+        self.title_group.apply(title)

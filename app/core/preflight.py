@@ -44,6 +44,51 @@ def _file_problem(path: str) -> str | None:
     return None
 
 
+def _content_problem(path: str) -> str | None:
+    """Проверяет, что файл действительно открывается как DOCX или PDF.
+
+    Файл может существовать и читаться, но быть битым или иметь неверное
+    расширение (например, старый .doc под именем .docx). Раньше такой файл
+    проходил проверку и ронял сборку.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext in (".docx", ".doc"):
+            import docx
+            docx.Document(path)
+        elif ext == ".pdf":
+            import pymupdf
+            with pymupdf.open(path) as pdf:
+                pdf.page_count
+    except Exception as e:
+        return (f"файл не открывается: {path} ({type(e).__name__}: {e}). "
+                f"Проверьте формат: поддерживаются DOCX и PDF")
+    return None
+
+
+def _readable_problem(path: str) -> str | None:
+    """Документ Word читается, но текста для вывода в нём нет.
+
+    Возвращает предупреждение (лист выйдет заглушкой) либо None.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".docx", ".doc"):
+        return None
+    try:
+        from .docx_reader import read_docx
+        content = read_docx(path)
+    except Exception:
+        return None            # ошибку открытия уже сообщил _content_problem
+    if getattr(content, "is_empty", False):
+        return ("файл прочитан, но текста для вывода в нём нет — "
+                "лист будет показан заглушкой (проверьте, не свёрстан ли текст "
+                "в надписях/фигурах или колонтитулах)")
+    if getattr(content, "text_in_textboxes", False):
+        return ("текст найден в надписях/фигурах Word — он будет выведен, но "
+                "правка в предпросмотре к такому тексту не применяется")
+    return None
+
+
 def run_preflight(project: VolumeProject) -> PreflightResult:
     """Проверяет проект перед сборкой тома/раздела.
 
@@ -75,6 +120,16 @@ def run_preflight(project: VolumeProject) -> PreflightResult:
         problem = _file_problem(d.path)
         if problem:
             res.errors.append(f"документ «{d.doc_kind.value}»: {problem}")
+            continue
+        # Ошибка только по включённым документам; битый файл ловится здесь,
+        # а не падением сборки.
+        problem = _content_problem(d.path)
+        if problem:
+            res.errors.append(f"документ «{d.doc_kind.value}»: {problem}")
+            continue
+        note = _readable_problem(d.path)
+        if note:
+            res.warnings.append(f"документ «{d.doc_kind.value}»: {note}")
 
     # --- приложения (только если раздел приложений включён) ---
     if "appendix" in enabled_kinds:
@@ -82,6 +137,11 @@ def run_preflight(project: VolumeProject) -> PreflightResult:
             if not a.needed:
                 continue
             problem = _file_problem(a.file_path)
+            if problem:
+                label = a.number or a.name or a.file_path or "?"
+                res.errors.append(f"приложение {label}: {problem}")
+                continue
+            problem = _content_problem(a.file_path)
             if problem:
                 label = a.number or a.name or a.file_path or "?"
                 res.errors.append(f"приложение {label}: {problem}")

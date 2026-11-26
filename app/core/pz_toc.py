@@ -38,17 +38,90 @@ from dataclasses import dataclass
 #: Заголовок оглавления.
 TOC_TITLE = "ОГЛАВЛЕНИЕ"
 
-#: Максимальный уровень заголовка, учитываемый в оглавлении.
-MAX_LEVEL = 4
+#: Максимальный уровень заголовка, попадающего в оглавление (1..3).
+#: Заголовки 4-го уровня и глубже в оглавление НЕ входят.
+MAX_LEVEL = 3
+
+#: Предел уровня заголовка при разборе DOCX (выше MAX_LEVEL — отбрасывается).
+LEVEL_LIMIT = 9
 
 #: Отступ строки оглавления на один уровень (мм) — для DOCX и HTML.
-LEVEL_INDENT_MM = 8.0
+#: Считается по метрикам шрифта: ровно ОДИН символ текста ПЗ. Строка 2-го
+#: уровня сдвинута на символ от 1-го, строка 3-го — ещё на символ от 2-го.
+#: Значение — запасное, если метрики шрифта недоступны (см. level_indent_mm).
+LEVEL_INDENT_MM = 2.2
 
-#: Позиция правой табуляции с отточием в DOCX (мм от левого края текста).
-DOCX_TAB_POS_MM = 175.0
+#: Символ, по ширине которого считается отступ уровня.
+LEVEL_INDENT_CHAR = "0"
+
+#: Внутренний отступ текста от линий рамки (мм) — как `padding` .sheet-content.
+SHEET_PAD_MM = 6.0
+
+#: Правая граница текстовой области листа (мм от левого поля): 185 мм рамки
+#: минус 6 мм внутреннего отступа. По ней выравниваются номера листов.
+DOCX_TAB_POS_MM = 179.0
+
+#: Префикс имён закладок заголовков (гиперссылки оглавления → заголовок).
+ANCHOR_PREFIX = "MIMO_H"
+
+
+def heading_anchor(para_index) -> str:
+    """Имя закладки (HTML-якоря) заголовка по индексу его абзаца."""
+    try:
+        index = int(para_index)
+    except (TypeError, ValueError):
+        return ""
+    return f"{ANCHOR_PREFIX}{index}" if index >= 0 else ""
+
+
+def anchor_map(items) -> dict:
+    """{индекс абзаца: имя закладки} для строк оглавления."""
+    return {int(item.para_index): item.anchor
+            for item in (items or []) if item.anchor}
+
+
+def toc_text_style() -> tuple:
+    """Шрифт и кегль строк оглавления — как у обычного текста ПЗ.
+
+    Требование к записке: оглавление набирается тем же шрифтом и кеглем, что и
+    обычный текст (config.TextFonts, группа «body»), а не кеглем карты кеглей.
+    """
+    try:
+        from ..config import load_config
+        fonts = load_config().text_fonts
+        return (fonts.font("body") or "", float(fonts.size("body")))
+    except Exception:
+        return "", 12.0
 
 #: Пунктов в миллиметре (для оценки высоты строки оглавления).
 PT_PER_MM = 72.0 / 25.4
+
+
+def level_indent_mm(level) -> float:
+    """Отступ строки оглавления для уровня: один СИМВОЛ текста ПЗ на уровень.
+
+    Требование к записке: строка 2-го уровня сдвинута вправо на один символ
+    относительно 1-го, строка 3-го — ещё на один символ относительно 2-го.
+    Ширина символа берётся из файла шрифта оглавления при его кегле, поэтому
+    отступ масштабируется вместе с настройкой шрифта текста ПЗ; если метрик
+    нет — используется LEVEL_INDENT_MM.
+    """
+    try:
+        step = float(level) if level else 1.0
+    except (TypeError, ValueError):
+        step = 1.0
+    count = max(0, int(step) - 1)
+    if not count:
+        return 0.0
+    try:
+        from .textfit import font_path, text_width_mm
+        family, size = toc_text_style()
+        char_mm = text_width_mm(LEVEL_INDENT_CHAR, size, font_path(family or None))
+        if not char_mm or char_mm <= 0:
+            char_mm = LEVEL_INDENT_MM
+    except Exception:
+        char_mm = LEVEL_INDENT_MM
+    return char_mm * count
 
 # --- Нормализация текста ----------------------------------------------------
 
@@ -99,15 +172,10 @@ def same_text(left, right) -> bool:
 
 # --- Распознавание заголовков -----------------------------------------------
 
-# Стиль абзаца — заголовок (как его называет Word и ГОСТ-шаблоны).
-_STYLE_HEADING_RE = re.compile(
-    r"(heading|заголов|название\s*раздела|раздел\b|section\s*heading|title)", re.I)
 # Номер уровня в имени стиля («Heading 2», «Заголовок 3», «H2»).
 _STYLE_LEVEL_RE = re.compile(r"(\d+)")
 # Номер раздела в начале текста заголовка: «2.1.3 Наименование».
 _LEADING_NUM_RE = re.compile(r"^(\d+(?:\.\d+)*)\.?\s+")
-# Строка-заголовок без стиля: короткая, без точки в конце, без «пустого» текста.
-_SENTENCE_END_RE = re.compile(r"[.:;,!?]$")
 
 
 @dataclass
@@ -143,77 +211,78 @@ class TocItem:
         """Строка оглавления «номер + наименование»."""
         return (self.num + " " + self.text).strip() if self.num else self.text
 
+    @property
+    def anchor(self) -> str:
+        """Имя закладки заголовка (цель гиперссылки строки оглавления)."""
+        return heading_anchor(self.para_index)
+
 
 def _paragraph_level(para) -> int:
-    """Уровень заголовка (1..MAX_LEVEL) — стиль Word, затем эвристика.
+    """Уровень заголовка (1..LEVEL_LIMIT) — только из стиля Word.
 
-    Стиль «Heading N» / «Заголовок N» задаёт уровень точно. Если стиль не
-    проставлен, уровень определяется по нумерации текста («2.1 Название» -> 2),
-    иначе заголовок считается первого уровня.
+    Стиль «Heading N» / «Заголовок N» задаёт уровень своим номером. Стиль-
+    заголовок без номера («Заголовок») считается первым уровнем.
+
+    Уровень НЕ ограничивается сверху: решение о том, попадает ли заголовок в
+    оглавление, принимает collect_headings (уровни 1..MAX_LEVEL).
     """
     try:
         level = int(getattr(para, "level", 0) or 0)
     except (TypeError, ValueError):
         level = 0
     if level > 0:
-        return max(1, min(MAX_LEVEL, level))
+        return max(1, min(LEVEL_LIMIT, level))
     style = (getattr(para, "style_name", "") or "").strip().lower()
     m = _STYLE_LEVEL_RE.search(style or "")
-    if m and _STYLE_HEADING_RE.search(style):
+    if m and _STYLE_HEADING_RE.search(style or ""):
         try:
-            return max(1, min(MAX_LEVEL, int(m.group(1))))
+            return max(1, min(LEVEL_LIMIT, int(m.group(1))))
         except ValueError:
             pass
-    m = _LEADING_NUM_RE.match(clean_text(getattr(para, "text", "")))
-    if m:
-        return max(1, min(MAX_LEVEL, m.group(1).count(".") + 1))
     return 1
 
 
 def is_heading_paragraph(para) -> bool:
     """Абзац является заголовком для оглавления?
 
-    Порядок проверки:
-      1) пустой абзац (только пробелы/переносы/разрывы страницы) — не заголовок;
-      2) стиль Word «Heading N» / «Заголовок N» — заголовок;
-      3) пункт списка (w:numPr) — не заголовок (нумерованные перечисления ПЗ
-         в оглавление не входят);
-      4) заголовок без стиля: короткий абзац (< 200 знаков), без завершающей
-         точки и выделенный (полужирный) или центрированный.
+    Единственный признак — **стиль Word**: «Heading N» / «Заголовок N» (включая
+    стили, созданные на основе них) или имя стиля, содержащее «heading».
+    Полужирный шрифт, центрирование, длина строки и завершающая точка НЕ
+    учитываются — это было эвристикой, и она втягивала в оглавление формулы и
+    подписи таблиц.
+
+    Отбрасывается только абзац без текста: выводить в оглавление нечего.
     """
-    text = clean_text(getattr(para, "text", ""))
-    if not text:
-        return False                      # пустой абзац / только пробелы / перенос
-    if len(text) > 200:
+    if not getattr(para, "is_heading", False):
         return False
-    if not same_text(text, text):         # защита от непечатных «мусорных» строк
-        return False
-    fmt = getattr(para, "fmt", None)
-    has_list = bool(fmt is not None and getattr(fmt, "has_list", False))
-    style = (getattr(para, "style_name", "") or "").strip().lower()
-    if not has_list and _STYLE_HEADING_RE.search(style or ""):
-        return True
-    try:
-        level = int(getattr(para, "level", 0) or 0)
-    except (TypeError, ValueError):
-        level = 0
-    if level > 0:
-        return True
-    if getattr(para, "is_heading", False):
-        return True
-    if has_list:
-        return False
-    if _SENTENCE_END_RE.search(text):
-        return False
-    bold = any(getattr(r, "bold", False) for r in (getattr(para, "runs", None) or []))
-    align = (getattr(para, "alignment", "") or "").upper()
-    if bold or align == "CENTER":
-        return True
-    return False
+    return bool(clean_text(getattr(para, "text", "")))
+
+
+def heading_emphasis(para) -> tuple:
+    """Начертание абзаца в выводе ПЗ: (полужирный, курсив).
+
+    Заголовок выводится **полужирным** — выделение, как было в записке; курсив
+    берётся из исходника (у заголовков он сохраняется). Обычный текст записки
+    печатается единым — без полужирного и курсива.
+
+    Единое правило для предпросмотра, DOCX и «нормализованной» копии, по которой
+    Word размечает листы: начертание меняет ширину строк, и копия должна мерить
+    те же строки, что вывод.
+    """
+    if not is_heading_paragraph(para):
+        return False, False
+    runs = getattr(para, "runs", None) or []
+    return True, any(bool(getattr(r, "italic", False)) for r in runs)
 
 
 def collect_headings(content, sheets: dict | None = None) -> list:
     """Заголовки DOCX в порядке документа с номерами листов ПЗ.
+
+    Отбор — только по стилю Word (см. is_heading_paragraph): каждый абзац со
+    стилем-заголовком даёт отдельный пункт, других условий нет.
+
+    В оглавление попадают только заголовки уровней 1..MAX_LEVEL (1–3):
+    заголовки 4-го уровня и глубже отбрасываются.
 
     :param content: DocxContent (app.core.docx_reader.read_docx).
     :param sheets: {индекс абзаца: номер листа} — из sheet_numbers(); если не
@@ -224,8 +293,11 @@ def collect_headings(content, sheets: dict | None = None) -> list:
     for index, para in enumerate(getattr(content, "paragraphs", None) or []):
         if not is_heading_paragraph(para):
             continue
+        level = _paragraph_level(para)
+        if level > MAX_LEVEL:
+            continue
         out.append(Heading(index=index, text=clean_text(para.text),
-                           level=_paragraph_level(para),
+                           level=level,
                            sheet=int(sheets.get(index, 0) or 0)))
     return out
 
@@ -239,6 +311,11 @@ def sheet_numbers(content, path: str = "") -> dict:
     (preview_html._paginate_docx), поэтому номера листов в оглавлении совпадают
     с листами записки. Разрыв страницы, заданный в Word, учтён алгоритмом
     пагинации: абзац с «с новой страницы» начинает следующий лист.
+
+    Границы листов определяет РАЗМЕТКА WORD (`word_pagination`), а не оценка
+    по высоте строк: оценочная раскладка давала 2 листа вместо 13, и половина
+    заголовков получала один и тот же номер. Кэш раскладки читается с диска;
+    если его нет — работает оценка (предпросмотр пересчитает через Word).
     """
     try:
         from .preview_html import _paginate_docx
@@ -247,7 +324,15 @@ def sheet_numbers(content, path: str = "") -> dict:
         # рисуются и пагинируются с формы 6 (штамп 15 мм) — бюджет первого
         # листа должен совпадать с фактическим штампом, иначе разбивка и
         # номера листов в оглавлении разойдутся с предпросмотром.
-        pages = _paginate_docx(content, path or "", first_form="2a")
+        word_layout = None
+        if path:
+            try:
+                from .word_pagination import cached_docx_pages
+                word_layout = cached_docx_pages(path, first_form="2a")
+            except Exception:
+                word_layout = None
+        pages = _paginate_docx(content, path or "", first_form="2a",
+                               word_layout=word_layout)
     except Exception:
         return {}
     numbers: dict = {}
@@ -264,24 +349,54 @@ def sheet_numbers(content, path: str = "") -> dict:
     return numbers
 
 
-def paginate_items(items) -> list:
+def _toc_row_height_mm(item, size_pt: float, line_mm: float, path: str = "") -> float:
+    """Высота строки оглавления с учётом ПЕРЕНОСА длинного наименования.
+
+    Строка «номер — наименование — отточие — номер листа» переносится, если
+    наименование не влезает в одну строку (в ПЗ наименования бывают по 200
+    знаков). Раньше каждая строка считалась однострочной, и пагинация
+    оглавления давала 2 листа вместо 3 — номера листов в оглавлении сдвигались.
+    """
+    from .textfit import font_path, text_width_mm, visual_lines
+    if not path:
+        path = font_path()
+    indent = level_indent_mm(getattr(item, "level", 1))
+    # Справа от наименования стоит номер листа (до трёх знаков) и отточие.
+    reserve = text_width_mm("000", size_pt, path) + 2.0
+    avail = DOCX_TAB_POS_MM - SHEET_PAD_MM - indent - reserve
+    label = getattr(item, "label", None) or getattr(item, "text", "") or ""
+    lines = max(1, visual_lines(label, avail, size_pt, path))
+    return lines * line_mm + 0.8
+
+
+def paginate_items(items, size_pt: float | None = None) -> list:
     """Разбивает строки оглавления по листам записки.
 
-    Высота строки берётся из той же модели, что и пагинация ПЗ (кегль 11pt,
-    line-height 1.4), а доступная высота — как у листов ПЗ: первый лист несёт
-    штамп формы 5 (40 мм), последующие — формы 6 (15 мм). Поэтому число листов
-    оглавления совпадает с фактическим размещением в предпросмотре и сборке.
+    Высота строки берётся из той же модели, что и пагинация ПЗ, и совпадает с
+    тем, что рисует HTML: строка `toc_html` — это кегль обычного текста ПЗ
+    (`toc_text_style`, по умолчанию 12 pt) с высотой строки
+    `preview_html._line_height`, плюс внутренние отступы `padding:0.4mm 0`
+    сверху и снизу. Длинное наименование занимает несколько строк (см.
+    `_toc_row_height_mm`). Доступная высота — как у листов ПЗ: первый лист несёт
+    штамп формы 5 (40 мм), последующие — формы 6.
+
+    :param size_pt: кегль строк оглавления; None — как у текста ПЗ (кегль
+        строк оглавления равен кеглю обычного текста записки).
     """
-    from .preview_html import _page_text_height, FORM_HEIGHT
-    # Высота строки оглавления с запасом (кегль 12pt, line-height 1.4): оценка
-    # должна быть консервативной, чтобы строка не уехала под штамп листа.
-    per_line_mm = 12.0 * 1.4 / PT_PER_MM     # ~5.9 мм на строку
+    from .preview_html import _page_text_height, _line_height, FORM_HEIGHT
+    if size_pt is None:
+        size_pt = toc_text_style()[1]
+    # Высота одной строки кегля; отступы строки (0.4 мм сверху и снизу)
+    # добавляются к строке-строке один раз — в _toc_row_height_mm.
+    line_mm = _line_height(size_pt)
     title_mm = 18.0                          # заголовок «ОГЛАВЛЕНИЕ» + отступ
     first_budget = _page_text_height(FORM_HEIGHT[2])     # форма 5 (40 мм)
     next_budget = _page_text_height(FORM_HEIGHT["2a"])   # форма 6 (15 мм)
     pages, cur, used, budget = [], [], 0.0, first_budget
     for item in items or []:
-        height = per_line_mm + (title_mm if getattr(item, "is_title", False) else 0.0)
+        height = _toc_row_height_mm(item, size_pt, line_mm)
+        if getattr(item, "is_title", False):
+            height += title_mm
         if cur and used + height > budget:
             pages.append(cur)
             cur, used, budget = [], 0.0, next_budget
@@ -298,9 +413,14 @@ def toc_pages(content, path: str = "", sheets: dict | None = None) -> list:
 
 
 def item_dicts(items) -> list:
-    """Строки оглавления как простые словари (для снимка предпросмотра)."""
+    """Строки оглавления как простые словари (для снимка предпросмотра).
+
+    para_index нужен предпросмотру: по нему строка оглавления связывается с
+    абзацем-целью гиперссылки (якорь `MIMO_H{индекс}`).
+    """
     return [{"kind": it.kind, "text": it.text, "num": it.num,
-             "level": int(it.level), "page": int(it.page)} for it in (items or [])]
+             "level": int(it.level), "page": int(it.page),
+             "para_index": int(it.para_index)} for it in (items or [])]
 
 
 def items_from_dicts(raw) -> list:
@@ -312,7 +432,8 @@ def items_from_dicts(raw) -> list:
                                text=item.get("text", ""),
                                num=item.get("num", ""),
                                level=int(item.get("level", 1) or 1),
-                               page=int(item.get("page", 0) or 0)))
+                               page=int(item.get("page", 0) or 0),
+                               para_index=int(item.get("para_index", -1) or -1)))
         elif isinstance(item, (list, tuple)) and len(item) >= 2:
             out.append(TocItem(kind=item[0], text=item[1],
                                num=item[2] if len(item) > 2 else "",
@@ -377,43 +498,20 @@ def build_toc_items(content, path: str = "", sheets: dict | None = None) -> list
     return items
 
 
-def pz_sheet_offset(project) -> int:
-    """Сдвиг номеров листов записки для печати в оглавлении (номер − 1).
+def toc_page_offset(project) -> int:
+    """Сдвиг номеров листов в строках оглавления.
 
-    В оглавлении номера считаются от начала ЗАПИСКИ (лист 1 — первый лист после
-    оглавления), а в томе записка начинается позже (после содержания). Сдвиг
-    равен «номер первого листа раздела ПЗ в томе минус 1», поэтому напечатанный
-    номер совпадает с квадратом сквозной нумерации на листе.
+    Номера в оглавлении должны совпадать с номером, напечатанным внизу листа
+    записки (графа «Лист» штампа), то есть считаться **внутри раздела ПЗ**, без
+    сквозной нумерации тома. Штамп ведёт нумерацию по разделу, и листы
+    оглавления — его первые листы: первый лист самой записки получает номер
+    «число листов оглавления + 1».
 
-    Сдвиг = (номер первого листа раздела ПЗ − 1) + число листов оглавления:
-    листы оглавления занимают начало раздела, поэтому лист записки с локальным
-    номером 1 идёт сразу после них.
-
-    Единый источник номера — app.core.toc.build_layout (учитывает структуру
-    тома и листы самого оглавления).
+    Поэтому сдвиг всегда равен числу листов оглавления и не зависит от того,
+    каким по счёту идёт раздел ПЗ в томе (раньше для тома прибавлялся номер
+    первого листа раздела, и оглавление показывало сквозные номера).
     """
-    try:
-        from .toc import build_layout
-        for item in build_layout(project).items:
-            if item.kind == "pz" and item.count > 0:
-                base = max(0, int(item.first_sheet) - 1)
-                return base + project_toc_sheets(project)
-    except Exception:
-        pass
-    return 0
-
-
-def toc_page_offset(project, standalone: bool = False) -> int:
-    """Сдвиг номеров листов в оглавлении для печати строк.
-
-    :param standalone: True — раздел собирается отдельно (нумерация листов
-        начинается с 1), тогда сдвиг равен числу листов самого оглавления;
-        False — том целиком, сдвиг считается по структуре тома
-        (см. pz_sheet_offset).
-    """
-    if standalone:
-        return max(0, int(project_toc_sheets(project) or 0))
-    return pz_sheet_offset(project)
+    return max(0, int(project_toc_sheets(project) or 0))
 
 
 def project_toc_enabled(project) -> bool:
@@ -507,14 +605,22 @@ def project_toc_items(project) -> tuple:
 
 # --- Вывод: HTML, DOCX, PDF --------------------------------------------------
 
-def toc_html(items, *, title: str = TOC_TITLE, body_size: int = 11,
-             title_size: int = 14, offset: int = 0) -> str:
+def toc_html(items, *, title: str = TOC_TITLE, body_size: float | None = None,
+             title_size: int = 14, offset: int = 0,
+             font_family: str = "") -> str:
     """HTML-разметка листа оглавления (для предпросмотра и сборки в HTML).
 
     Отточие — точечная нижняя граница «резинки» между текстом и номером листа,
-    как заполнитель табуляции в Word. Размеры — в пунктах карты кеглей
-    (app.config.FontMap).
+    как заполнитель табуляции в Word.
 
+    Оформление строк — как у обычного текста записки: тот же шрифт и кегль
+    (`toc_text_style`), без полужирного; номер листа прижат к правому краю
+    текстовой области. Наименование заголовка — ссылка на сам заголовок
+    (`#MIMO_H{индекс абзаца}`), поэтому в предпросмотре и собранном HTML
+    работает переход к пункту.
+
+    :param body_size: кегль строк, pt; None — кегль обычного текста ПЗ.
+    :param font_family: имя шрифта ПЗ; пусто — из настроек текста ПЗ.
     :param offset: сдвиг номеров листов: номера в строках оглавления считаются
         от начала ЗАПИСКИ (лист 1 — первый лист после оглавления), а в томе
         записка начинается не с первого листа. offset = номер первого листа
@@ -524,34 +630,45 @@ def toc_html(items, *, title: str = TOC_TITLE, body_size: int = 11,
     def esc(value) -> str:
         return html_mod.escape(str(value if value is not None else ""))
 
+    style_font, style_size = toc_text_style()
+    if body_size is None:
+        body_size = style_size
+    family = (font_family or style_font or "").strip()
+    family_css = f"font-family:'{family}',Arial,sans-serif;" if family else ""
+
     shift = max(0, int(offset or 0))
     lines = []
     for item in items:
         if item.is_title:
             lines.append(
                 f'<h1 style="font-size:{title_size}pt;text-align:center;'
+                f'{family_css}'
                 f'font-weight:bold;margin:0 0 8mm 0;">{esc(title)}</h1>')
             continue
-        indent = LEVEL_INDENT_MM * max(0, int(item.level) - 1)
-        size = body_size
-        weight = "bold"
-        num_html = (f'<span style="flex:0 0 auto;white-space:nowrap;font-weight:bold;'
+        indent = level_indent_mm(item.level)
+        num_html = (f'<span style="flex:0 0 auto;white-space:nowrap;'
                     f'margin-right:1.5mm;">{esc(item.num)}</span>'
                     if item.num else "")
         page = int(item.page or 0)
         page_html = (f'<span style="flex:0 0 auto;white-space:nowrap;margin-left:1.5mm;">'
                      f'{esc(page + shift)}</span>' if page else
                      '<span style="flex:0 0 auto;margin-left:1.5mm;">&nbsp;</span>')
+        text_html = esc(item.text)
+        if item.anchor:
+            text_html = (f'<a href="#{esc(item.anchor)}" '
+                         f'style="color:inherit;text-decoration:none;">'
+                         f'{text_html}</a>')
         # Текст заголовка может быть длинным (в т.ч. без пробелов), поэтому
         # он СЖИМАЕТСЯ (flex:0 1 auto + min-width:0) и переносится на строки.
         # Иначе длинное наименование распирало flex-строку, и номер листа с
         # отточием уходили за правую рамку листа (правый край был не виден).
         lines.append(
-            f'<div style="display:flex;align-items:baseline;font-size:{size}pt;'
-            f'font-weight:{weight};margin-left:{indent:g}mm;padding:0.4mm 0;">'
+            f'<div style="display:flex;align-items:baseline;'
+            f'font-size:{body_size:g}pt;{family_css}font-weight:normal;'
+            f'margin-left:{indent:g}mm;padding:0.4mm 0;">'
             f'{num_html}'
             f'<span style="flex:0 1 auto;min-width:0;overflow-wrap:break-word;'
-            f'word-break:break-word;">{esc(item.text)}</span>'
+            f'word-break:break-word;">{text_html}</span>'
             f'<span style="flex:1 1 auto;border-bottom:0.3mm dotted #000;'
             f'margin:0 0.5mm 0.9mm 0.5mm;min-width:6mm;"></span>'
             f'{page_html}</div>')
@@ -570,7 +687,8 @@ def toc_pdf_lines(items, *, title: str = TOC_TITLE, width: int = 95,
     for item in items:
         if item.is_title:
             continue
-        indent = " " * (2 * max(0, int(item.level) - 1))
+        # Отступ уровня — один символ текста на уровень (как в HTML и DOCX).
+        indent = " " * max(0, int(item.level) - 1)
         left = f"{indent}{item.label}"
         page = str(int(item.page) + shift) if item.page else ""
         space = max(1, width - len(left) - len(page) - 2)

@@ -3,6 +3,7 @@
 для последующего переоформления под ГОСТ."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -30,6 +31,10 @@ class Paragraph:
     # app.core.pz_format.ParagraphFormat. Заполняется read_docx; None означает
     # «оформление неизвестно» (объект создан вручную или из старого кэша).
     fmt: object = None
+    #: True — абзац взят из «надписи» (фигуры Word, w:txbxContent). Такого
+    #: абзаца нет в document.paragraphs, поэтому он НЕ адресуется для правок:
+    #: иначе правка записалась бы в чужой абзац файла.
+    from_textbox: bool = False
 
     @property
     def text(self) -> str:
@@ -40,6 +45,7 @@ class Paragraph:
 class TableCell:
     text: str = ""
     bold: bool = False
+    alignment: str = ""
     # Адрес ячейки в исходном DOCX (document.tables[table_index]
     # .rows[row_index].cells[cell_index]). Нужен для записи правок таблиц
     # обратно в файл из предпросмотра (app.core.docx_edit.apply_table_cell_edits).
@@ -68,6 +74,11 @@ class TableCell:
 class DocTable:
     rows: list = field(default_factory=list)   # list of list[TableCell]
     table_index: int = -1                      # индекс таблицы в document.tables
+    #: Число строк-шапок (w:tblHeader) в начале таблицы. Word повторяет их ВСЕ
+    #: при переносе таблицы на следующий лист, поэтому пагинация должна
+    #: повторять столько же — иначе на листе-продолжении окажется меньше строк,
+    #: чем разметил Word, и низ листа останется пустым.
+    header_rows: int = 0
 
 
 @dataclass
@@ -92,6 +103,16 @@ class DocxContent:
     # Оформление абзацев: app.core.pz_format.ParagraphFormats
     # ({индекс абзаца в document.paragraphs: ParagraphFormat} + .headings).
     formats: object = None
+    #: True — текст найден в «надписях» (фигуры Word, w:txbxContent), а не в
+    #: обычных абзацах. Такая записка требует внимания: правки в предпросмотре
+    #: к ней не применяются, разметка страниц исходника не сохраняется.
+    text_in_textboxes: bool = False
+
+    @property
+    def is_empty(self) -> bool:
+        """В документе нет ни текста, ни таблиц (показывать нечего)."""
+        has_text = any((p.text or "").strip() for p in self.paragraphs)
+        return not has_text and not self.tables
 
     @property
     def plain_text(self) -> str:
@@ -159,123 +180,108 @@ def _cell_merge_flags(tc) -> tuple:
     return vmerge, grid_span, hmerged
 
 
-def table_grid_cells(table, table_index: int) -> list:
-    """Сетка ячеек таблицы DOCX для предпросмотра и записи правок.
+def _header_row_count(table) -> int:
+    """Сколько строк в начале таблицы помечено как шапка (w:tblHeader).
 
-    Возвращает список строк, каждая строка — список TableCell по числу
-    физических ячеек w:tc в строке (len(row.cells)) с адресом
-    (table_index, row_index, cell_index) и размерами объединения row_span /
-    col_span. Адресация совпадает с document.tables[t].rows[r].cells[c], поэтому
-    по ней можно записать правку обратно в файл.
-
-    Объединённые ячейки распознаются по XML строки (w:gridSpan / w:hMerge /
-    w:vMerge), потому что python-docx разрешает любую позицию объединения в
-    ячейку-начало и по его API отличить ячейки внутри объединения нельзя.
-    В предпросмотре:
-      * начало горизонтального объединения получает col_span > 1;
-      * начало вертикального объединения получает row_span > 1;
-      * поглощённые ячейки помечаются continuation="horizontal"/"vertical":
-        первые не рисуются (их перекрывает начало объединения), вторые рисуются
-        пустыми там, где начало объединения осталось на предыдущем листе.
+    Word повторяет при переносе таблицы на следующий лист ВСЕ такие строки, а не
+    только первую. Пагинация должна повторять столько же: иначе на
+    листе-продолжении окажется меньше строк, чем разметил Word.
     """
-    # Важно: row.cells в python-docx РАЗРЕШАЕТ объединённые ячейки в ячейку-
-    # начало, поэтому флаги объединения читаем у «сырых» элементов w:tc.
-    trs = list(table._tbl.tr_lst)
-    raw_tcs = [[tc for tc in tr.tc_lst] for tr in trs]
-    raw_flags = [[_cell_merge_flags(tc) for tc in tr_tcs] for tr_tcs in raw_tcs]
-    # Схлопываем горизонтальные объединения логически: одна запись на колонку.
-    flags = []
-    for r, row_flags in enumerate(raw_flags):
-        logical = []
-        pending = 0
-        for (vmerge, grid_span, hmerged) in row_flags:
-            if pending > 0:
-                # Продолжение уже учтённого объединения по горизонтали.
-                logical.append((vmerge, 0, True))
-                pending -= 1
-                continue
-            logical.append((vmerge, grid_span, hmerged))
-            if grid_span > 1:
-                pending = grid_span - 1
-        flags.append(logical)
+    from docx.oxml.ns import qn
 
-    from docx.table import _Cell
+    count = 0
+    for row in table.rows:
+        tr_pr = row._tr.find(qn("w:trPr"))
+        header = tr_pr.find(qn("w:tblHeader")) if tr_pr is not None else None
+        if header is None:
+            break
+        val = header.get(qn("w:val"))
+        if val is not None and str(val).strip().lower() in ("0", "false", "off"):
+            break
+        count += 1
+    return count
 
-    # Число логических колонок таблицы (по сумме gridSpan строки).
-    total_cols = 1
-    for row_flags in flags:
-        total_cols = max(total_cols, sum(max(1, f[1]) for f in row_flags))
+
+def table_grid_cells(table, table_index: int) -> list:
+    """Сетка ячеек таблицы DOCX, выровненная по КОЛОНКАМ сетки (w:tblGrid).
+
+    В каждой строке ровно столько ячеек, сколько колонок в таблице, поэтому все
+    строки встают по своим колонкам.
+
+    Почему не по «сырым» w:tc: Word описывает объединения двумя способами
+    (w:gridSpan и legacy w:hMerge), и в одном файле они встречаются вместе.
+    Подсчёт физических w:tc давал лишние колонки — таблица разваливалась:
+    правые ячейки уезжали за границу и вставали со сдвигом по вертикали
+    (например, колонка «Пол» в штатном расписании). python-docx сам разрешает
+    объединения по сетке: row.cells отдаёт по одной ячейке на колонку, повторяя
+    объединённую, поэтому совпадение элемента w:tc и есть признак объединения.
+
+    Адрес ячейки (table_index, row_index, cell_index) — индексы в
+    document.tables[t].rows[r].cells[c]; по нему записываются правки из
+    предпросмотра (Word перенаправляет запись в начало объединения).
+
+    В предпросмотре:
+      * начало объединения по горизонтали получает col_span > 1;
+      * начало объединения по вертикали получает row_span > 1;
+      * поглощённые ячейки помечаются continuation="horizontal" (не рисуются,
+        их перекрывает начало объединения) либо "vertical" (рисуются пустыми
+        там, где начало объединения осталось на предыдущем листе).
+    """
+    grid = [list(row.cells) for row in table.rows]
+    total_rows = len(grid)
+    if not total_rows:
+        return []
+    total_cols = max(len(row) for row in grid)
+    # Элементы w:tc по колонкам: объединённая ячейка повторяется на каждой
+    # колонке, которую занимает.
+    elem = [[cell._tc for cell in row] for row in grid]
 
     rows_out = []
-    total_rows = len(raw_tcs)
-    for r, tr_tcs in enumerate(raw_tcs):
+    for r in range(total_rows):
+        row_elems = elem[r]
+        row_cells = grid[r]
         cells_out = []
-        logical_pos = 0
-        for c, tc in enumerate(tr_tcs):
-            cell = _Cell(tc, table)
-            vmerge, grid_span, hmerged = flags[r][c]
-            if hmerged:
-                # Поглощена горизонтальным объединением: колонку занимает начало.
-                cells_out.append(TableCell(text="", bold=False,
-                                           continuation="horizontal"))
-                logical_pos += 1
+        for c in range(total_cols):
+            tc = row_elems[c] if c < len(row_elems) else None
+            prev = row_elems[c - 1] if c > 0 and (c - 1) < len(row_elems) else None
+            if tc is None:
+                # Строка короче сетки (нестандартная разметка) — добираем пустой.
+                cells_out.append(TableCell(continuation="horizontal"))
                 continue
-            if vmerge == "continue":
-                # Продолжение вертикального объединения: текст берём из начала
-                # (Word хранит его только там), адрес оставляем свой — Word
-                # при записи перенаправит правку в ячейку-начало.
-                text = ""
-                bold = False
-                for rr in range(r - 1, -1, -1):
-                    prev_flag = flags[rr][c] if c < len(flags[rr]) else ("", 1, False)
-                    if prev_flag[0] == "restart":
-                        try:
-                            src = _Cell(raw_tcs[rr][c], table)
-                            text = (src.text or "").strip()
-                            bold = _cell_bold(src)
-                        except (IndexError, ValueError):
-                            text, bold = "", False
-                        break
-                    if prev_flag[0] != "continue":
-                        break
-                row_span = 1
-                for rr in range(r + 1, total_rows):
-                    nxt = flags[rr][c] if c < len(flags[rr]) else ("", 1, False)
-                    if nxt[0] != "continue":
-                        break
-                    row_span += 1
-                cells_out.append(TableCell(text=text, bold=bold,
-                                           table_index=table_index,
+            if c > 0 and tc is prev:
+                # Та же ячейка, что и слева — колонку занимает начало объединения.
+                cells_out.append(TableCell(continuation="horizontal"))
+                continue
+            # Размер объединения по горизонтали.
+            col_span = 1
+            while (c + col_span < len(row_elems)
+                   and row_elems[c + col_span] is tc):
+                col_span += 1
+            # Та же ячейка выше — это продолжение вертикального объединения.
+            # Горизонтальный охват (col_span) считается и здесь: продолжение
+            # занимает столько же колонок, сколько начало объединения, иначе в
+            # строке оставалась бы незанятая колонка — дыра в таблице.
+            above = elem[r - 1] if r > 0 else None
+            if above is not None and c < len(above) and above[c] is tc:
+                cells_out.append(TableCell(table_index=table_index,
                                            row_index=r, cell_index=c,
-                                           row_span=row_span,
+                                           row_span=1, col_span=col_span,
                                            continuation="vertical"))
-                logical_pos += 1
                 continue
+            # Размер объединения по вертикали.
             row_span = 1
-            for rr in range(r + 1, total_rows):
-                nxt = flags[rr][c] if c < len(flags[rr]) else ("", 1, False)
-                if nxt[0] != "continue":
-                    break
+            while (r + row_span < total_rows
+                   and c < len(elem[r + row_span])
+                   and elem[r + row_span][c] is tc):
                 row_span += 1
-            span = max(1, grid_span)
+            cell = row_cells[c]
             cells_out.append(TableCell(text=(cell.text or "").strip(),
                                        bold=_cell_bold(cell),
+                                       alignment=_cell_alignment(cell),
                                        table_index=table_index,
                                        row_index=r, cell_index=c,
                                        row_span=row_span,
-                                       col_span=span))
-            logical_pos += span
-            # Колонки, занятые объединением, дополняем невидимыми ячейками,
-            # чтобы строки таблицы выравнивались по своим колонкам.
-            for _ in range(span - 1):
-                cells_out.append(TableCell(text="", bold=False,
-                                           continuation="horizontal"))
-        # Выравниваем строку по числу колонок таблицы (строки с объединениями
-        # короче остальных).
-        while logical_pos < total_cols:
-            cells_out.append(TableCell(text="", bold=False,
-                                       continuation="horizontal"))
-            logical_pos += 1
+                                       col_span=col_span))
         rows_out.append(cells_out)
     return rows_out
 
@@ -289,8 +295,216 @@ def _cell_bold(cell) -> bool:
         return False
 
 
+def _cell_alignment(cell) -> str:
+    try:
+        if not cell.paragraphs:
+            return ""
+        paragraph = cell.paragraphs[0]
+        alignment = _alignment_of(paragraph.paragraph_format)
+        if alignment:
+            return alignment
+        style = paragraph.style
+        seen = set()
+        while style is not None and style.style_id not in seen:
+            seen.add(style.style_id)
+            alignment = _alignment_of(style.paragraph_format)
+            if alignment:
+                return alignment
+            style = style.base_style
+    except Exception:
+        pass
+    return ""
+
+
+def style_name_of(paragraph, cache: dict | None = None) -> str:
+    """Имя стиля абзаца; разрешение кэшируется по styleId.
+
+    ``paragraph.style`` поднимает styles.xml и разрешает наследование при
+    каждом обращении — около 1 мс на абзац (0.27 с на записке в 240 абзацев),
+    хотя различных стилей в документе единицы. Кэш по styleId сохраняет именно
+    имя стиля, а не сырой идентификатор: у типовых записок styleId числовые
+    («1», «20» → «heading 1», «heading 2»), и по ним заголовок не распознать.
+
+    :param cache: словарь {styleId: имя} на документ (см. _read_docx_uncached).
+    """
+    try:
+        style_id = str(getattr(paragraph._p, "style", "") or "")
+    except Exception:
+        style_id = ""
+    if cache is not None and style_id in cache:
+        return cache[style_id]
+    try:
+        name = paragraph.style.name if paragraph.style else ""
+    except Exception:
+        name = ""
+    if cache is not None:
+        cache[style_id] = name
+    return name
+
+
+def _read_paragraph(block, formats, para_index: int, style_is_heading,
+                    style_cache: dict | None = None) -> Paragraph:
+    """Разбирает один абзац DOCX: стиль, выравнивание, runs и оформление."""
+    # Имя стиля разрешается через кэш: повторные абзацы того же стиля не
+    # поднимают styles.xml заново (см. style_name_of).
+    style_nm = style_name_of(block, style_cache)
+    fmt = formats.get(para_index)
+    try:
+        alignment = _alignment_of(block.paragraph_format) if block.paragraph_format else ""
+    except Exception:
+        alignment = ""
+    para = Paragraph(
+        style_name=style_nm,
+        alignment=alignment,
+        is_heading=style_is_heading(style_nm),
+        fmt=fmt,
+    )
+    if style_nm.lower().startswith("heading"):
+        try:
+            para.level = int("".join(ch for ch in style_nm if ch.isdigit()) or 0)
+        except Exception:
+            para.level = 0
+    for run in block.runs:
+        try:
+            r = Run(
+                text=run.text,
+                bold=bool(run.bold),
+                italic=bool(run.italic),
+                underline=bool(run.underline),
+                font=run.font.name or "",
+                size_pt=(run.font.size.pt if run.font.size else 0.0),
+            )
+        except Exception:
+            r = Run(text=getattr(run, "text", "") or "")
+        para.runs.append(r)
+    # Выравнивание берём из разобранного оформления, если прямое
+    # выравнивание абзаца в файле не задано (в Word оно наследуется
+    # от стиля).
+    if not para.alignment and fmt is not None and getattr(fmt, "alignment", ""):
+        para.alignment = str(fmt.alignment).upper()
+    return para
+
+
+def _textbox_paragraphs(block) -> list:
+    """Абзацы из «надписей» внутри абзаца DOCX (фигуры/текстовые поля Word).
+
+    Word хранит текст фигуры в `w:txbxContent` — внутри `v:textbox` (VML) или
+    `wps:txbx` (DrawingML). `python-docx` не включает это содержимое в
+    `paragraph.runs`, поэтому его читаем из XML напрямую, сохраняя порядок
+    абзацев и их оформление (полужирный, выравнивание по стилю фигуры теряется —
+    это осознанное упрощение).
+    """
+    try:
+        element = block._p
+    except Exception:
+        return []
+    from docx.oxml.ns import qn
+    out = []
+    # w:txbxContent встречается и в VML (v:textbox), и в DrawingML (wps:txbx).
+    for holder in element.iter(qn("w:txbxContent")):
+        for p_el in holder.findall(qn("w:p")):
+            runs = []
+            for r_el in p_el.findall(qn("w:r")):
+                text = "".join(t.text or "" for t in r_el.iter(qn("w:t")))
+                if not text:
+                    continue
+                bold = r_el.find(qn("w:rPr") + "/" + qn("w:b")) is not None
+                italic = r_el.find(qn("w:rPr") + "/" + qn("w:i")) is not None
+                runs.append(Run(text=text, bold=bold, italic=italic))
+            if not runs:
+                continue
+            out.append(Paragraph(runs=runs, alignment="", from_textbox=True))
+    return out
+
+
+def docx_cache_key(path: str) -> tuple | None:
+    """Ключ состояния файла для кэшей: (путь, время изменения, размер).
+
+    None — файла нет или он недоступен (кэшировать нечего). Общий помощник:
+    по этому ключу кэшируется и разбор DOCX, и разбивка по листам, поэтому
+    любая запись в файл автоматически сбрасывает оба кэша.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (os.path.abspath(path), int(st.st_mtime_ns), int(st.st_size))
+
+
+def paragraph_formats(path: str):
+    """Оформление абзацев DOCX по настройкам проекта (см. pz_format).
+
+    Вынесено из разбора документа: часть потребителей (подготовка
+    нормализованной копии для Word) нуждается только в оформлении абзацев и не
+    использует ни тексты, ни таблицы. Полный ``read_docx`` тратил бы на них
+    время зря — разбор стоит 0.5–0.9 с на записке в 240 абзацев.
+    """
+    try:
+        from .pz_format import read_paragraph_formats, DEFAULT_INDENT_CHARS
+        # Абзацный отступ (5 знаков) берётся из конфигурации оформления:
+        # его величина в миллиметрах считается от кегля основного текста ПЗ
+        # (5 × 14 pt × 0.5 = 35 pt = 12.35 мм), а не от кегля Word.
+        indent_chars = DEFAULT_INDENT_CHARS
+        indent_size_pt = 11.0
+        try:
+            from ..config import load_config
+            cfg = load_config()
+            indent_chars = cfg.paragraph_indent_chars
+            # Кегль для пересчёта знаков в мм — кегль обычного текста из
+            # настроек (config.TextFonts): при его смене отступ пересчитывается.
+            indent_size_pt = float(cfg.text_fonts.body_size)
+        except Exception:
+            pass
+        return read_paragraph_formats(path, base_size_pt=11.0,
+                                      indent_chars=indent_chars,
+                                      indent_size_pt=indent_size_pt)
+    except Exception:
+        return None
+
+
 def read_docx(path: str) -> DocxContent:
-    """Открывает DOCX и извлекает структурированное содержимое."""
+    """Открывает DOCX и извлекает структурированное содержимое.
+
+    Результат кэшируется по (путь, время изменения, размер): за одно
+    переключение раздела предпросмотр читает один и тот же DOCX несколько раз
+    (подсчёт листов для содержания и штампа, оглавление, сами листы), и каждый
+    разбор файла занимал сотни миллисекунд — переключение ощущалось медленным.
+    Кэш сбрасывается сам при изменении файла (правка абзаца, автосохранение).
+    """
+    path = path or ""
+    if not path or not os.path.exists(path):
+        return _read_docx_uncached(path)
+    key = docx_cache_key(path)
+    if key is None:
+        return _read_docx_uncached(path)
+    cached = _DOCX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    content = _read_docx_uncached(path)
+    if len(_DOCX_CACHE) >= _DOCX_CACHE_LIMIT:
+        _DOCX_CACHE.clear()
+    _DOCX_CACHE[key] = content
+    return content
+
+
+#: Кэш разобранных DOCX: (путь, время изменения, размер) -> DocxContent.
+_DOCX_CACHE: dict = {}
+_DOCX_CACHE_LIMIT = 24
+
+
+def clear_docx_cache(path: str | None = None) -> None:
+    """Сбрасывает кэш разбора DOCX (после записи правок в файл)."""
+    if path is None:
+        _DOCX_CACHE.clear()
+        return
+    target = os.path.abspath(path)
+    for key in [k for k in _DOCX_CACHE if k[0] == target]:
+        _DOCX_CACHE.pop(key, None)
+
+
+def _read_docx_uncached(path: str) -> DocxContent:
     from docx import Document
     from docx.document import Document as DocType
     from docx.table import Table as DocTableType
@@ -301,11 +515,7 @@ def read_docx(path: str) -> DocxContent:
     # Оформление абзацев (отступы, интервалы, выравнивание, списки) читается из
     # XML документа: python-docx не отдаёт наследование свойств стилей, а без
     # него предпросмотр и экспорт теряли абзацные отступы и списки Word.
-    try:
-        from .pz_format import read_paragraph_formats
-        content.formats = read_paragraph_formats(path, base_size_pt=11.0)
-    except Exception:
-        content.formats = None
+    content.formats = paragraph_formats(path)
     # Индекс таблицы в document.tables. Порядок таблиц тела документа совпадает
     # с порядком document.tables, поэтому он годится для записи правок.
     table_index = -1
@@ -331,47 +541,44 @@ def read_docx(path: str) -> DocxContent:
 
     formats = getattr(content, "formats", None) or {}
     para_index = -1
+    # Кэш «styleId -> имя стиля» на документ: разные абзацы почти всегда
+    # используют одни и те же стили, а разрешение имени стоит около 1 мс.
+    style_cache: dict = {}
     for block in iter_block_items(doc):
         if isinstance(block, ParaType):
             para_index += 1
-            style_nm = block.style.name if block.style else ""
-            fmt = formats.get(para_index)
-            para = Paragraph(
-                style_name=style_nm,
-                alignment=_alignment_of(block.paragraph_format) if block.paragraph_format else "",
-                is_heading=style_is_heading(style_nm),
-                fmt=fmt,
-            )
-            if style_nm.lower().startswith("heading"):
-                # уровень
-                try:
-                    lvl = int("".join(ch for ch in style_nm if ch.isdigit()) or 0)
-                    para.level = lvl
-                except Exception:
-                    para.level = 0
-            for run in block.runs:
-                r = Run(
-                    text=run.text,
-                    bold=bool(run.bold),
-                    italic=bool(run.italic),
-                    underline=bool(run.underline),
-                    font=run.font.name or "",
-                    size_pt=(run.font.size.pt if run.font.size else 0.0),
-                )
-                para.runs.append(r)
-            # Выравнивание берём из разобранного оформления, если прямое
-            # выравнивание абзаца в файле не задано (в Word оно наследуется
-            # от стиля).
-            if not para.alignment and fmt is not None and getattr(fmt, "alignment", ""):
-                para.alignment = str(fmt.alignment).upper()
+            # Один «нестандартный» абзац (неизвестный стиль, битый элемент)
+            # не должен ронять разбор всего документа: раньше исключение здесь
+            # приводило к тому, что в предпросмотре вместо записки появлялась
+            # заглушка. При сбое берём из абзаца хотя бы текст.
+            try:
+                para = _read_paragraph(block, formats, para_index, style_is_heading,
+                                       style_cache)
+            except Exception:
+                para = Paragraph(runs=[Run(text=block.text or "")])
             content.paragraphs.append(para)
             content.blocks.append(("paragraph", para))
             if para.is_heading and para.text.strip():
                 content.headings.append(para)
+            # Текст внутри «надписи» (фигуры Word: w:pict/v:textbox,
+            # mc:AlternateContent/wps:txbx → w:txbxContent). python-docx его в
+            # runs не отдаёт, а типовые записки верстают текст именно так —
+            # раньше такой документ считался пустым и лист выходил пустым.
+            try:
+                tb_paras = _textbox_paragraphs(block)
+            except Exception:
+                tb_paras = []
+            for tb_para in tb_paras:
+                content.paragraphs.append(tb_para)
+                content.blocks.append(("paragraph", tb_para))
+                if tb_para.is_heading and tb_para.text.strip():
+                    content.headings.append(tb_para)
+                content.text_in_textboxes = True
         elif isinstance(block, DocTableType):
             table_index += 1
             rows = table_grid_cells(block, table_index)
-            table = DocTable(rows=rows, table_index=table_index)
+            table = DocTable(rows=rows, table_index=table_index,
+                             header_rows=_header_row_count(block))
             content.tables.append(table)
             content.blocks.append(("table", table))
 

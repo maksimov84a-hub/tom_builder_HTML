@@ -18,16 +18,37 @@ from __future__ import annotations
 import os
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QProgressBar,
+    QStackedLayout,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
-from PySide6.QtCore import QUrl, QTimer, Signal
+from PySide6.QtCore import QUrl, QTimer, Signal, Qt
 
-from ..core.preview_html import render_sheet, render_sheet_fragments
+from ..core.preview_html import (render_sheet, render_sheet_fragments,
+                                 render_preview_error)
 from .preview_bridge import PreviewBridge
 
 ZOOM_STEP = 0.1
+#: Пауза после остановки ввода, через которую правка ПЗ пишется в DOCX.
+AUTOSAVE_DELAY_MS = 1000
+
+
+def _log_preview_error(kind: str, reason: str) -> str:
+    """Пишет сбой предпросмотра в tmp/build.log и возвращает путь к логу."""
+    import logging
+    log_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "tmp", "build.log")
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        logging.basicConfig(filename=log_path, filemode="a", level=logging.INFO,
+                            format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        logging.getLogger("tom_builder.preview").exception(
+            "предпросмотр: сбой для пункта kind=%s: %s", kind, reason)
+    except Exception:
+        pass
+    return log_path
 
 
 class SheetPreview(QWidget):
@@ -38,6 +59,14 @@ class SheetPreview(QWidget):
     paragraph_changed = Signal(int, str, str)   # (индекс абзаца, путь DOCX, текст)
     cell_changed = Signal(int, int, int, str, str)  # (табл., строка, ячейка, DOCX, текст)
     save_pz_requested = Signal()                # «Сохранить правки ПЗ» нажата
+    #: Правки накопились и их пора записать в связанный DOCX (автосохранение).
+    autosave_requested = Signal()
+    repaginate_requested = Signal()
+    #: Перерисован набор листов: основные надписи (HTML) по порядку листов и
+    #: скрытый реестр подписантов — панель внизу окна правит те же поля.
+    stamps_changed = Signal(list, str)
+    #: Сменился активный лист — индекс в списке основных надписей.
+    active_stamp_changed = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -47,12 +76,25 @@ class SheetPreview(QWidget):
         self._bridge.paragraph_changed.connect(self._on_paragraph_changed)
         self._bridge.table_cell_changed.connect(self._on_table_cell_changed)
         self._bridge.zoom_changed.connect(self._on_zoom_changed)
+        self._bridge.scroll_changed.connect(self._on_scroll_changed)
+        self._bridge.active_sheet_changed.connect(self.active_stamp_changed)
+        #: Основные надписи листов текущего набора (HTML, по порядку листов).
+        self._stamps: list = []
+        #: Реестр подписантов (скрытые span) — чтобы панель внизу окна сразу
+        #: показывала подпись по фамилии, не дожидаясь перерисовки листа.
+        self._signer_registry: str = ""
         # Несохранённые правки абзацев ПЗ: {путь DOCX: {индекс: текст}}.
         # Применяются поверх текста файла, чтобы правки не терялись при
         # перерисовке листов и при переключении по дереву.
         self._pz_edits: dict = {}
         # Несохранённые правки ячеек таблиц ПЗ: {путь DOCX: {"т:с:я": текст}}.
         self._pz_cell_edits: dict = {}
+        # Автосохранение: правка уходит в связанный DOCX сама, через паузу
+        # после остановки ввода (а также при переключении листа и сборке).
+        self._autosave = QTimer(self)
+        self._autosave.setSingleShot(True)
+        self._autosave.setInterval(AUTOSAVE_DELAY_MS)
+        self._autosave.timeout.connect(self.flush_autosave)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -78,6 +120,9 @@ class SheetPreview(QWidget):
             "Записать изменения текста пояснительной записки в исходный DOCX")
         self.btn_save_pz.clicked.connect(self.save_pz_requested)
         self.btn_save_pz.setVisible(False)
+        self.btn_repaginate = QPushButton("Пересчитать страницы")
+        self.btn_repaginate.setVisible(False)
+        self.btn_repaginate.clicked.connect(lambda: self.repaginate_requested.emit())
         # Индикатор числа листов в предпросмотре (документ ПЗ показывается
         # целиком, несколькими листами подряд).
         self.lbl_sheets = QLabel("Листов: 1")
@@ -89,12 +134,67 @@ class SheetPreview(QWidget):
         bar.addStretch(1)
 
         bar.addWidget(self.btn_save_pz)
+        bar.addWidget(self.btn_repaginate)
         bar.addWidget(self.lbl_sheets)
         bar.addWidget(self.lbl_zoom)
         lay.addLayout(bar)
 
+        self.preview_stack = QStackedLayout()
+        self.preview_stack.setStackingMode(QStackedLayout.StackingMode.StackAll)
         self.view = QWebEngineView()
-        lay.addWidget(self.view, stretch=1)
+        self.preview_stack.addWidget(self.view)
+        self.progress_overlay = QWidget()
+        self.progress_overlay.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.progress_overlay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.progress_overlay.setStyleSheet("background:rgba(245,247,250,210);")
+        overlay_layout = QVBoxLayout(self.progress_overlay)
+        overlay_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        overlay_layout.setContentsMargins(20, 20, 20, 20)
+        self.progress_card = QWidget()
+        self.progress_card.setFixedWidth(380)
+        self.progress_card.setStyleSheet(
+            "QWidget { background:#ffffff; border:1px solid #d0d5dd; "
+            "border-radius:10px; }")
+        card_layout = QVBoxLayout(self.progress_card)
+        card_layout.setContentsMargins(24, 20, 24, 20)
+        card_layout.setSpacing(12)
+        self.progress_title = QLabel("Пересчёт страниц ПЗ")
+        self.progress_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_title.setStyleSheet(
+            "border:0; background:transparent; color:#344054; font-size:15px; "
+            "font-weight:600;")
+        self.progress_message = QLabel("Подготовка документа…")
+        self.progress_message.setWordWrap(True)
+        self.progress_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.progress_message.setStyleSheet(
+            "border:0; background:transparent; color:#475467; font-size:12px;")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(10)
+        card_layout.addWidget(self.progress_title)
+        card_layout.addWidget(self.progress_message)
+        card_layout.addWidget(self.progress_bar)
+        overlay_layout.addWidget(self.progress_card)
+        self.preview_stack.addWidget(self.progress_overlay)
+        self.progress_overlay.hide()
+        lay.addLayout(self.preview_stack, stretch=1)
+
+        # Разрешаем странице читать локальные файлы: логотип графы 9 и
+        # изображения подписей лежат на диске. Страница грузится через
+        # setHtml(about:blank), и по умолчанию QtWebEngine такие запросы
+        # блокирует — картинки молча не отображались.
+        try:
+            from PySide6.QtWebEngineCore import QWebEngineSettings
+            st = self.view.settings()
+            st.setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls,
+                True)
+            st.setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls,
+                True)
+        except Exception:
+            pass
 
         self.channel = QWebChannel()
         self.channel.registerObject("bridge", self._bridge)
@@ -104,6 +204,14 @@ class SheetPreview(QWidget):
         self._pending_snapshot = {}
         self._pending_kind = "cover"
         self._zoom = 1.0
+        #: Положение прокрутки (приходит из JS) и признак «лист перерисован
+        #: после правки»: в этом случае масштаб и место прокрутки сохраняются,
+        #: иначе вид перескакивал бы на начало тома после каждой правки поля.
+        self._last_scroll = 0.0
+        self._keep_view = False
+        #: Вписывать по ПЕРВОМУ листу (графическая часть: перечень листов A4,
+        #: остальные листы раздела — чертёжные A1/A2, они в разы больше).
+        self._fit_first = False
 
         # Прокрутка к началу после загрузки
         self.view.loadFinished.connect(self._on_load)
@@ -116,14 +224,38 @@ class SheetPreview(QWidget):
         показываются все листы подряд — с той же пагинацией и сквозной
         нумерацией, что и при сборке. Для стандартных листов ГОСТ — один лист.
         """
+        # Тот же самый лист (тот же раздел и тот же документ) перерисовывается
+        # после правки — тогда сохраняем масштаб и место прокрутки.
+        self._keep_view = (self._pending_kind == kind
+                           and self._pending_snapshot.get("section")
+                           == snapshot.get("section")
+                           and self._pending_snapshot.get("path")
+                           == snapshot.get("path"))
         self._pending_kind = kind
         self._pending_snapshot = dict(snapshot)
+        self.btn_repaginate.setVisible(snapshot.get("section") == "Пояснительная записка")
+        self.btn_repaginate.setEnabled(not bool(snapshot.get("pagination_busy")))
+        self.btn_repaginate.setText("Пересчёт…" if snapshot.get("pagination_busy") else
+                                    "Пересчитать страницы")
+        stale = bool(snapshot.get("pagination_stale"))
+        self.btn_repaginate.setStyleSheet(
+            "QPushButton { background:#f59e0b; color:#1f2937; font-weight:600; }"
+            if stale else "")
+        self.btn_repaginate.setToolTip(snapshot.get("pagination_error") or
+                                       "Пересчитать разбиение DOCX средствами Word")
         self._pending_snapshot["pz_edits"] = self.pz_pending_edits()
         self._pending_snapshot["pz_cell_edits"] = self.pz_pending_cell_edits()
+        # Графическая часть: вписываем в окно первый лист — перечень листов.
+        # Чертежи (A1/A2) в разы больше, и масштаб по самому большому листу
+        # делал перечень нечитаемо мелким.
+        from ..models import SECTION_GRAPHIC
+        self._fit_first = snapshot.get("section") == SECTION_GRAPHIC
         html, count = self._build_html(kind, self._pending_snapshot, project)
         self._current_html = html
         self.lbl_sheets.setText(f"Листов: {count}")
         self.view.setHtml(html, QUrl("about:blank"))
+        # Панель внизу окна показывает и правит основную надпись активного листа.
+        self.stamps_changed.emit(list(self._stamps), self._signer_registry)
 
     def _build_html(self, kind: str, snapshot: dict, project=None):
         """Собирает HTML предпросмотра. Возвращает (html, число листов)."""
@@ -139,19 +271,65 @@ class SheetPreview(QWidget):
                 snapshot["pz_editable"] = True
         try:
             fragments = render_sheet_fragments(kind, snapshot, project=project)
-        except Exception:
-            fragments = []
+        except Exception as e:
+            # Раньше исключение молча превращалось в заглушку «Не удалось
+            # отобразить содержимое файла» — причина сбоя терялась. Теперь она
+            # пишется в tmp/build.log и выводится на самом листе.
+            reason = f"{type(e).__name__}: {e}"
+            log_path = _log_preview_error(kind, reason)
+            self._stamps = []
+            self._signer_registry = ""
+            return render_preview_error(kind, snapshot, reason, log_path), 1
         if not fragments:
-            return render_sheet(kind, snapshot), 1
-        from ..core.preview_html import _preview_document
-        return _preview_document(fragments), len(fragments)
+            self._stamps = []
+            self._signer_registry = ""
+            return render_preview_error(
+                kind, snapshot,
+                "не удалось получить ни одного листа для выбранного пункта"), 1
+        from ..core.preview_html import (_preview_document, extract_stamp_html,
+                                         _signer_registry_html)
+        # Основные надписи листов — для панели внизу окна (у обложки и титула
+        # штампа нет, в списке остаётся пустая строка).
+        self._stamps = [extract_stamp_html(f) for f in fragments]
+        self._signer_registry = _signer_registry_html(snapshot)
+        return _preview_document(fragments, snapshot), len(fragments)
 
     def refresh(self, kind: str, snapshot: dict, project=None) -> None:
         """Перерисовать текущий лист после изменения данных."""
         self.show_sheet(kind, snapshot, project)
 
+    def set_pagination_state(self, *, stale: bool, busy: bool, error: str = "",
+                             message: str = "") -> None:
+        self.btn_repaginate.setEnabled(not busy)
+        self.btn_repaginate.setText("Пересчёт…" if busy else "Пересчитать страницы")
+        self.btn_repaginate.setStyleSheet(
+            "QPushButton { background:#f59e0b; color:#1f2937; font-weight:600; }"
+            if stale else "")
+        self.btn_repaginate.setToolTip(error or
+                                       "Пересчитать разбиение DOCX средствами Word")
+        show_overlay = bool(busy and self._pending_snapshot.get("section") ==
+                            "Пояснительная записка")
+        self.progress_overlay.setVisible(show_overlay)
+        if show_overlay:
+            self.progress_message.setText(message or "Word рассчитывает разбиение страниц…")
+
     def _on_load(self, ok: bool) -> None:
-        QTimer.singleShot(100, self._fit_to_window)
+        if self._keep_view:
+            # Лист перерисован после правки: возвращаем прежний масштаб и место
+            # прокрутки, иначе пользователя «перебрасывало» на начало тома.
+            QTimer.singleShot(60, self._restore_view)
+        else:
+            QTimer.singleShot(100, self._fit_to_window)
+
+    def _restore_view(self) -> None:
+        """Возвращает масштаб и положение прокрутки, бывшие до перерисовки."""
+        self.view.page().runJavaScript(
+            "document.body.style.zoom = '%f'; window.scrollTo(0, %f);"
+            % (self._zoom, self._last_scroll))
+
+    def _on_scroll_changed(self, position: float) -> None:
+        """JS сообщил положение прокрутки — запоминаем для возврата после правки."""
+        self._last_scroll = float(position)
 
     def _apply_zoom(self) -> None:
         """Применяет текущий масштаб к телу страницы."""
@@ -167,22 +345,34 @@ class SheetPreview(QWidget):
         self._set_zoom(self._zoom + delta)
 
     def _fit_to_window(self) -> None:
-        """Вписывает лист в окно (по умолчанию — под размер окна).
+        """Вписывает лист в окно.
 
-        Если показано несколько листов (документ ПЗ или раздел), масштаб
-        подбирается по самому широкому и самому высокому листу, чтобы ни один
-        лист не выходил за границы окна по горизонтали.
+        Для обычных разделов (записка, приложения) масштаб подбирается по
+        самому широкому и самому высокому листу, чтобы ни один лист не выходил
+        за границы окна по горизонтали.
+
+        Для ГРАФИЧЕСКОЙ ЧАСТИ вписывается ПЕРВЫЙ лист — перечень листов (A4).
+        Чертёжные листы (A1, A2) в разы больше, и масштаб по самому большому
+        листу делал перечень нечитаемо мелким. Остальные листы раздела
+        листаются прокруткой.
         """
+        fit_first = "true" if self._fit_first else "false"
         self.view.page().runJavaScript(
             """
-            (function(){
+            (function(fitFirst){
               var sheets = document.querySelectorAll('.sheet');
               if (!sheets.length) return;
               var w = 0, h = 0;
-              sheets.forEach(function(s){
-                w = Math.max(w, s.offsetWidth);
-                h = Math.max(h, s.offsetHeight);
-              });
+              if (fitFirst) {
+                // Графическая часть: масштаб по первому листу (перечень).
+                w = sheets[0].offsetWidth;
+                h = sheets[0].offsetHeight;
+              } else {
+                sheets.forEach(function(s){
+                  w = Math.max(w, s.offsetWidth);
+                  h = Math.max(h, s.offsetHeight);
+                });
+              }
               if (!w || !h) return;
               var vw = window.innerWidth, vh = window.innerHeight;
               var margin = 32;
@@ -200,8 +390,8 @@ class SheetPreview(QWidget):
               } else {
                 document.body.style.zoom = 1;
               }
-            })();
-            """)
+            })(%s);
+            """ % fit_first)
 
     # --- Служебное ---
     def set_html(self, html: str) -> None:
@@ -219,18 +409,40 @@ class SheetPreview(QWidget):
 
     # --- Inline-правка текста ПЗ ---
     def _on_paragraph_changed(self, index: int, path: str, text: str) -> None:
-        """Абзац ПЗ отредактирован в предпросмотре — копим правку (без записи)."""
+        """Абзац ПЗ отредактирован в предпросмотре — копим правку и планируем запись."""
         self._pz_edits.setdefault(path, {})[int(index)] = text
         self._update_save_button()
+        self._schedule_autosave()
         self.paragraph_changed.emit(int(index), path, text)
 
     def _on_table_cell_changed(self, table: int, row: int, cell: int,
                                path: str, text: str) -> None:
-        """Ячейка таблицы ПЗ отредактирована — копим правку (без записи в файл)."""
+        """Ячейка таблицы ПЗ отредактирована — копим правку и планируем запись."""
         address = f"{int(table)}:{int(row)}:{int(cell)}"
         self._pz_cell_edits.setdefault(path, {})[address] = text
         self._update_save_button()
+        self._schedule_autosave()
         self.cell_changed.emit(int(table), int(row), int(cell), path, text)
+
+    # --- Автосохранение правок в связанный DOCX ---
+    def _schedule_autosave(self) -> None:
+        """Перезапускает паузу автосохранения (ждём остановки ввода)."""
+        self._autosave.start()
+
+    def flush_autosave(self) -> None:
+        """Немедленно записывает накопленные правки (без паузы).
+
+        Вызывается по таймеру, а также принудительно — перед переключением
+        листа, сборкой и закрытием, чтобы правки не потерялись.
+        """
+        if self._autosave.isActive():
+            self._autosave.stop()
+        if self.has_pz_edits():
+            self.autosave_requested.emit()
+
+    def cancel_autosave(self) -> None:
+        """Отменяет отложенную запись (например, при смене проекта)."""
+        self._autosave.stop()
 
     def _update_save_button(self) -> None:
         """Показывает кнопку сохранения, когда есть несохранённые правки ПЗ."""
@@ -261,6 +473,7 @@ class SheetPreview(QWidget):
         if path is None:
             self._pz_edits.clear()
             self._pz_cell_edits.clear()
+            self._autosave.stop()
         else:
             self._pz_edits.pop(path, None)
             self._pz_cell_edits.pop(path, None)

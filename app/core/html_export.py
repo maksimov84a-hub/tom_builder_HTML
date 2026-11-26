@@ -21,8 +21,38 @@ def _page_layout(w_mm: float, h_mm: float) -> QPageLayout:
     # Явная ориентация Landscape/Portrait в QPageLayout ПОВОРАЧИВАЕТ страницу:
     # для альбомного листа (w > h) это даёт перевёрнутый формат (h x w). Поэтому
     # всегда используем Portrait — он не вращает страницу, а размер остаётся w x h.
-    ps = QPageSize(QSizeF(w_mm, h_mm), QPageSize.Millimeter)
+    #
+    # Размер задаётся в ТОЧКАХ, а не в миллиметрах: QPageSize(Millimeter)
+    # округляет стороны до целых пунктов (A4 → 595 x 842 pt = 209.9 мм), и
+    # правая линия рамки расходилась с краем листа. Точные пункты A4 —
+    # 595.276 x 841.890 (gost.A4_W_PT / A4_H_PT).
+    ps = QPageSize(QSizeF(_mm_to_pt(w_mm), _mm_to_pt(h_mm)), QPageSize.Point)
     return QPageLayout(ps, QPageLayout.Portrait, QMarginsF(0.0, 0.0, 0.0, 0.0))
+
+
+def _mm_to_pt(mm: float) -> float:
+    """Миллиметры в типографские пункты (1 pt = 25.4/72 мм)."""
+    return float(mm) * 72.0 / 25.4
+
+
+def _fix_page_size(pdf_path: str, w_mm: float, h_mm: float) -> None:
+    """Ставит страницам точный размер листа в пунктах.
+
+    Chromium печатает страницу на 0.15 мм уже и на 0.1 мм выше заданного
+    размера: на печати правая линия рамки уходила бы от края листа. Размер
+    выставляется через mediabox — содержимое при этом не масштабируется.
+    """
+    import pymupdf
+    w_pt, h_pt = _mm_to_pt(w_mm), _mm_to_pt(h_mm)
+    with pymupdf.open(pdf_path) as doc:
+        changed = False
+        for page in doc:
+            box = page.mediabox
+            if abs(box.width - w_pt) > 0.01 or abs(box.height - h_pt) > 0.01:
+                page.set_mediabox(pymupdf.Rect(0, 0, w_pt, h_pt))
+                changed = True
+        if changed:
+            doc.saveIncr()
 
 
 def html_to_pdf(html: str, out_path: str, w_mm: float = 210.0,
@@ -82,6 +112,13 @@ def html_to_pdf(html: str, out_path: str, w_mm: float = 210.0,
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, "wb") as f:
         f.write(result["data"])
+    # Chromium печатает страницу на доли миллиметра меньше заданной: размер
+    # выставляется точно по медиабоксу, содержимое не масштабируется.
+    try:
+        _fix_page_size(out_path, w_mm, h_mm)
+    except Exception:
+        # Не удалось поправить размер — PDF уже записан и пригоден к печати.
+        pass
     return out_path
 
 
@@ -207,7 +244,7 @@ def default_work_dir() -> str:
 
 
 def html_file_to_pdf(html_path: str, out_path: str, work_dir: str | None = None,
-                     **kwargs) -> str:
+                     progress_callback=None, **kwargs) -> str:
     """Преобразует HTML в PDF, сохраняя размер каждого листа.
 
     Листы графической части, помеченные data-pdf-src/data-pdf-page, вставляются
@@ -224,7 +261,10 @@ def html_file_to_pdf(html_path: str, out_path: str, work_dir: str | None = None,
     tmp = work_dir or default_work_dir()
     os.makedirs(tmp, exist_ok=True)
     parts = []
+    total = len(fragments)
     for index, fragment in enumerate(fragments):
+        if progress_callback:
+            progress_callback(index, total)
         part_path = os.path.join(tmp, f"page_{index:04d}.pdf")
         src = _fragment_source_pdf(fragment)
         if src is not None:
@@ -245,6 +285,8 @@ def html_file_to_pdf(html_path: str, out_path: str, work_dir: str | None = None,
                         w_mm=w_mm, h_mm=h_mm, **kwargs)
         parts.append(part_path)
     _merge_pdfs(parts, out_path)
+    if progress_callback:
+        progress_callback(total, total)
     # Промежуточные листы больше не нужны.
     for part in parts:
         try:

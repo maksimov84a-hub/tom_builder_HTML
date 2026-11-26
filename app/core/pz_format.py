@@ -56,6 +56,29 @@ DEFAULT_LINE_HEIGHT = 1.4
 # (360 twips). Нужна, если уровень списка не задаёт собственных отступов.
 DEFAULT_LIST_HANGING_MM = 360.0 * MM_PER_TWIP
 
+# Абзацный отступ («красная строка») по умолчанию — 5 знаков.
+# Один знак Word = половина кегля, поэтому при кегле текста ПЗ 14 pt:
+#   5 × 14 × 0.5 = 35 pt = 12.35 мм  (ГОСТ: 1.25 см).
+# Применяется к абзацам и пунктам списков, у которых Word отступ НЕ задаёт:
+# иначе текст ПЗ шёл бы от самой рамки, без красной строки.
+DEFAULT_INDENT_CHARS = 5.0
+
+
+def indent_mm_for_chars(chars: float, size_pt: float) -> float:
+    """Абзацный отступ в мм по числу знаков и кеглю (1 знак = 0.5 кегля).
+
+    PT_PER_MM — это «пунктов в миллиметре», поэтому пункты ДЕЛЯТСЯ на него:
+    5 знаков при 14 pt = 35 pt = 12.35 мм.
+    """
+    try:
+        chars = float(chars)
+        size_pt = float(size_pt)
+    except (TypeError, ValueError):
+        return 0.0
+    if chars <= 0 or size_pt <= 0:
+        return 0.0
+    return chars * size_pt * 0.5 / PT_PER_MM
+
 
 # --------------------------------------------------------------------------
 # Разбор значений
@@ -530,21 +553,30 @@ def clear_cache() -> None:
     _CACHE.clear()
 
 
-def read_paragraph_formats(path: str, base_size_pt: float = 11.0) -> ParagraphFormats:
+def read_paragraph_formats(path: str, base_size_pt: float = 11.0,
+                           indent_chars: float = DEFAULT_INDENT_CHARS,
+                           indent_size_pt: float | None = None) -> ParagraphFormats:
     """Оформление всех абзацев тела DOCX.
 
     :param path: путь к DOCX.
     :param base_size_pt: кегль по умолчанию — нужен только для перевода
         символьных отступов (w:leftChars и т. п.) в миллиметры.
+    :param indent_chars: абзацный отступ в знаках для абзацев, у которых Word
+        отступ не задаёт (по умолчанию 5 знаков).
+    :param indent_size_pt: кегль, от которого считается абзацный отступ
+        (кегль текста ПЗ по ГОСТ). None — берётся base_size_pt.
     :return: ParagraphFormats ({индекс абзаца: ParagraphFormat} + .headings —
         текст текущего заголовка для каждого абзаца, для колонтитула).
         Пустой результат, если файл не читается.
     """
     if not path or not os.path.exists(path):
         return ParagraphFormats()
+    if indent_size_pt is None:
+        indent_size_pt = base_size_pt
     try:
         stat = os.stat(path)
-        key = (os.path.abspath(path), int(stat.st_mtime_ns), int(stat.st_size))
+        key = (os.path.abspath(path), int(stat.st_mtime_ns), int(stat.st_size),
+               round(float(indent_chars), 3), round(float(indent_size_pt), 3))
     except OSError:
         return ParagraphFormats()
     cached = _CACHE.get(key)
@@ -552,7 +584,7 @@ def read_paragraph_formats(path: str, base_size_pt: float = 11.0) -> ParagraphFo
         return cached
 
     try:
-        result = _read_formats(path, base_size_pt)
+        result = _read_formats(path, base_size_pt, indent_chars, indent_size_pt)
     except Exception:
         result = ParagraphFormats()
     if len(_CACHE) >= _CACHE_LIMIT:
@@ -561,7 +593,11 @@ def read_paragraph_formats(path: str, base_size_pt: float = 11.0) -> ParagraphFo
     return result
 
 
-def _read_formats(path: str, base_size_pt: float) -> ParagraphFormats:
+def _read_formats(path: str, base_size_pt: float,
+                  indent_chars: float = DEFAULT_INDENT_CHARS,
+                  indent_size_pt: float | None = None) -> ParagraphFormats:
+    if indent_size_pt is None:
+        indent_size_pt = base_size_pt
     root, styles_root, numbering_root = _read_parts(path)
     styles, defaults = _parse_styles(styles_root)
     abstract, num_ids = ({}, {})
@@ -633,6 +669,19 @@ def _read_formats(path: str, base_size_pt: float) -> ParagraphFormats:
             fmt.marker_mm = round(fmt.left_mm + min(0.0, fmt.first_line_mm), 3)
             width = -fmt.first_line_mm if fmt.first_line_mm < 0 else 0.0
             fmt.marker_width_mm = round(width if width > 0.4 else DEFAULT_LIST_HANGING_MM, 3)
+
+        # Абзацный отступ по ГОСТ, если Word его не задал: 5 знаков от кегля
+        # текста ПЗ. Без этого текст шёл бы от самой рамки, без красной строки.
+        # Исключения:
+        #   * пункт списка — у него своя геометрия (left + hanging), и «красная
+        #     строка» сдвинула бы текст пункта относительно маркера;
+        #   * заголовок — по ГОСТ он центрируется, отступ первой строки ему не
+        #     нужен (иначе центрированный текст съезжал бы вправо).
+        is_heading_para = (_is_heading_style(style_id, styles)
+                           or _is_heading_by_styles(style_id, styles))
+        if (not fmt.has_list and not is_heading_para
+                and abs(fmt.first_line_mm) < 0.05):
+            fmt.first_line_mm = round(indent_mm_for_chars(indent_chars, indent_size_pt), 3)
 
         formats[index] = fmt
 
@@ -787,12 +836,18 @@ def _list_start(fmt: ParagraphFormat, num_ids: dict, abstract: dict) -> int:
 # --------------------------------------------------------------------------
 
 def paragraph_css(fmt: ParagraphFormat | None, *, extra: str = "",
-                  omit_text_indent: bool = False) -> str:
+                  omit_text_indent: bool = False,
+                  line_mm: float | None = None) -> str:
     """CSS абзаца (без шрифта и кегля) — отступы, интервалы, выравнивание.
 
     omit_text_indent=True — отступ первой строки не выводится. Нужно для пункта
     списка: «висячий» отступ Word там занят маркером, который в HTML рисуется
     отдельным абсолютным боксом, а сам текст пункта начинается на left_mm.
+
+    line_mm — высота строки в миллиметрах. Задаётся ЯВНО и тем же значением, что
+    получает Word при разметке страниц (preview_html.pz_line_mm): если высоту не
+    задать, браузер берёт `line-height:normal` (≈5.0 мм при 12 pt) и на лист
+    влезает больше строк, чем разметил Word, — низ листов остаётся пустым.
     """
     fmt = fmt or ParagraphFormat()
     parts = ["margin:0"]
@@ -811,6 +866,8 @@ def paragraph_css(fmt: ParagraphFormat | None, *, extra: str = "",
     line = fmt.css_line_height()
     if line:
         parts.append("line-height:%s" % line)
+    elif line_mm:
+        parts.append("line-height:%smm" % _num(line_mm))
     if extra:
         parts.append(extra)
     return ";".join(parts) + ";"

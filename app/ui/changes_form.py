@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
-    QFormLayout, QLineEdit, QComboBox, QDialog, QLabel, QMessageBox, QDateEdit,
+    QHBoxLayout, QPushButton, QFormLayout, QLineEdit, QComboBox,
+    QDialog, QDateEdit,
 )
-from PySide6.QtCore import Qt, QDate
+from PySide6.QtCore import QDate
 
 from ..models import ChangeRecord, ChangeStatus
+from .common import TableCrudForm
 
 
 class ChangeDialog(QDialog):
@@ -72,74 +73,29 @@ class ChangeDialog(QDialog):
         self.accept()
 
 
-class ChangesForm(QWidget):
+class ChangesForm(TableCrudForm):
     """Журнал изменений."""
 
+    headers = ("№", "Дата", "Содержание", "Раздел/Лист", "Исполнитель", "Статус")
+    delete_question = "Удалить запись об изменении?"
+
     def __init__(self, parent=None, get_signers=None):
-        super().__init__(parent)
         self._get_signers = get_signers or (lambda: [])
-        v = QVBoxLayout(self)
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["№", "Дата", "Содержание", "Раздел/Лист", "Исполнитель", "Статус"])
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        v.addWidget(self.table)
-
-        row = QHBoxLayout()
-        self.btn_add = QPushButton("Добавить")
-        self.btn_edit = QPushButton("Изменить")
-        self.btn_del = QPushButton("Удалить")
-        self.btn_add.clicked.connect(self._add)
-        self.btn_edit.clicked.connect(self._edit)
-        self.btn_del.clicked.connect(self._del)
-        row.addWidget(self.btn_add); row.addWidget(self.btn_edit); row.addWidget(self.btn_del)
-        row.addStretch(1)
-        v.addLayout(row)
-
-        self._records: list[ChangeRecord] = []
+        super().__init__(parent)
 
     def set_records(self, records: list) -> None:
-        self._records = records
-        self._refresh()
+        self.set_items(records)
 
     def get_records(self) -> list:
-        return self._records
+        return self.get_items()
 
-    def _signer_names(self) -> list:
-        return [s.surname for s in self._get_signers() if s.surname]
+    def cells(self, record) -> list:
+        return [str(record.number), record.date, record.description,
+                record.target, record.signer_surname, record.status.value]
 
-    def _refresh(self) -> None:
-        self.table.setRowCount(0)
-        for r in self._records:
-            i = self.table.rowCount()
-            self.table.insertRow(i)
-            self.table.setItem(i, 0, QTableWidgetItem(str(r.number)))
-            self.table.setItem(i, 1, QTableWidgetItem(r.date))
-            self.table.setItem(i, 2, QTableWidgetItem(r.description))
-            self.table.setItem(i, 3, QTableWidgetItem(r.target))
-            self.table.setItem(i, 4, QTableWidgetItem(r.signer_surname))
-            self.table.setItem(i, 5, QTableWidgetItem(r.status.value))
-        self.table.resizeColumnsToContents()
-
-    def _add(self) -> None:
-        dlg = ChangeDialog(self, signer_names=self._signer_names())
+    def ask_item(self, record):
+        names = [s.surname for s in self._get_signers() if s.surname]
+        dlg = ChangeDialog(self, record, names)
         if dlg.exec() == QDialog.Accepted and dlg.result_rec:
-            self._records.append(dlg.result_rec)
-            self._refresh()
-
-    def _edit(self) -> None:
-        row = self.table.currentRow()
-        if row < 0:
-            return
-        dlg = ChangeDialog(self, self._records[row], self._signer_names())
-        if dlg.exec() == QDialog.Accepted and dlg.result_rec:
-            self._records[row] = dlg.result_rec
-            self._refresh()
-
-    def _del(self) -> None:
-        row = self.table.currentRow()
-        if row < 0:
-            return
-        if QMessageBox.question(self, "Удалить", "Удалить запись об изменении?") == QMessageBox.Yes:
-            del self._records[row]
-            self._refresh()
+            return dlg.result_rec
+        return None

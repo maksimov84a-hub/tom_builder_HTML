@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from ..models import (VolumeProject, Signer, ChangeRecord, DocKind, Stage,
-                      STAMP9_LOGO)
+                      STAMP9_LOGO, stage_label, stamp_signature_rows)
 from .pdf_merge import compute_total_sheets
 from .toc import content_rows, total_sheets as toc_total_sheets
 
@@ -87,6 +87,26 @@ def _pz_toc(project: VolumeProject) -> tuple:
     return item_dicts(items), path
 
 
+def _signature_kinds(project: VolumeProject) -> list:
+    """Разделы, для которых собираются строки подписей штампа.
+
+    Правки хранятся по разделам (у каждого раздела свой штамп), поэтому в
+    снимок попадают все разделы структуры тома и уже сохранённые правки —
+    иначе правка раздела, лист которого сейчас не открыт, терялась бы.
+    """
+    kinds = []
+    for entry in (getattr(project, "structure", None) or []):
+        kind = (entry or {}).get("kind") if isinstance(entry, dict) else entry
+        if kind and kind not in kinds:
+            kinds.append(str(kind))
+    for kind in (getattr(project, "stamp_signatures", None) or {}):
+        if kind and kind not in kinds:
+            kinds.append(str(kind))
+    if "" not in kinds:
+        kinds.append("")
+    return kinds
+
+
 def build_preview_snapshot(project: VolumeProject) -> dict:
     """Собирает снимок значений для предпросмотра.
 
@@ -138,12 +158,39 @@ def build_preview_snapshot(project: VolumeProject) -> dict:
             "object_name": req.object_name,
             "volume_name": req.volume_name,
             "stage": req.stage.value if isinstance(req.stage, Stage) else str(req.stage),
+            # Полное наименование стадии — для обложки и титульного листа;
+            # в основной надписи выводится обозначение («П» / «Р»).
+            "stage_label": stage_label(req.stage),
             "city": req.city,
             "year": req.year,
         },
         "sections": list(req.sections),
+        # Дополнительные обозначения разделов: дописываются к обозначению тома
+        # в графе 1 основной надписи («02-2026-ТР» + «.ПЗ»).
+        "section_codes": dict(getattr(project, "section_codes", None) or {}),
         "cell9": cell9,
         "roles": roles,
+        # Таблица изменений штампа и даты подписей по разделам:
+        # {раздел: {"rows": [{"izm": "", ...}], "sign_dates": {...}}}.
+        # Правки ячеек из предпросмотра пишутся сюда же, поэтому значение
+        # обновляется на всех листах раздела.
+        "stamp_changes": {
+            str(k): {
+                "rows": [dict(r) for r in (v or {}).get("rows") or []
+                         if isinstance(r, dict)],
+                "sign_dates": dict((v or {}).get("sign_dates") or {}),
+            }
+            for k, v in (getattr(project, "stamp_changes", None) or {}).items()
+        },
+        # Строки подписей штампа по разделам и формам: должность, фамилия и
+        # дата каждой строки (значения по умолчанию + правки пользователя).
+        # Снимок собирается для ВСЕХ разделов, потому что формы 5 и 3 имеют
+        # разное число строк, и лист берёт набор по своему разделу и форме.
+        "stamp_signatures": {
+            str(kind): {str(form): stamp_signature_rows(project, kind, form)
+                        for form in (5, 3)}
+            for kind in _signature_kinds(project)
+        },
         "signers": signer_list,
         "changes": [
             {

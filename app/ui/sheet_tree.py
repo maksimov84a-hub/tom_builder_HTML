@@ -14,8 +14,6 @@
 """
 from __future__ import annotations
 
-import os
-
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QTreeWidget, QTreeWidgetItem,
     QLabel, QMessageBox,
@@ -23,22 +21,39 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 
 from ..models import (
-    VolumeProject, DocKind, SourceFile, Appendix,
+    VolumeProject,
     SECTION_COVER, SECTION_TITLE, SECTION_CONTENT, SECTION_PZ, SECTION_GRAPHIC,
-    SECTION_APPENDIX, SECTION_CHANGES, SECTION_LABELS,
+    SECTION_APPENDIX, SECTION_CHANGES, SECTION_COMPOSITION, SECTION_LABELS,
 )
 
 # Роли хранения данных в элементах дерева
 _SEC_ROLE = Qt.UserRole          # ключ раздела (str)
-_DOC_ROLE = Qt.UserRole + 1      # объект SourceFile
-_APP_ROLE = Qt.UserRole + 2      # объект Appendix
-_NODE_ROLE = Qt.UserRole + 3     # тип узла: "section" | "doc" | "appendix"
+_NODE_ROLE = Qt.UserRole + 1     # тип узла (в дереве только "section")
+
+
+def _section_sheets(project: VolumeProject, kind: str) -> int:
+    """Число листов раздела (для колонки «Листы»); 0 — раздел пуст.
+
+    Считается по единому источнику нумерации (toc.build_layout), чтобы число
+    в дереве совпадало с содержанием и собранным томом.
+    """
+    try:
+        from ..core.toc import build_layout
+        total = 0
+        for it in build_layout(project).items:
+            if it.section_key == kind:
+                total += max(0, int(it.count or 0))
+        return total
+    except Exception:
+        return 0
 
 
 class SheetTree(QWidget):
     """Дерево структуры тома. Выбор листа -> сигнал selection_changed(dict)."""
 
     selection_changed = Signal(dict)
+    #: Изменена отметка «включать в сборку» (раздел, документ или приложение).
+    item_modified = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -94,33 +109,35 @@ class SheetTree(QWidget):
 
     # ---- построение дерева ----
     def _refresh(self, select_key: str | None = None) -> None:
-        """Перестраивает дерево. select_key — ключ раздела для восстановления выбора."""
+        """Перестраивает дерево. select_key — ключ раздела для восстановления выбора.
+
+        В дереве показываются ТОЛЬКО разделы тома: документы и приложения здесь
+        не выводятся, чтобы список отражал состав тома, а не файлы. Управление
+        документами раздела (добавление, флажок «В сборку», удаление) — в
+        контекстной панели справа («Документы раздела»).
+        """
         self._updating = True
+        # Выбранный раздел запоминается ДО очистки дерева: после clear()
+        # currentItem уже пуст, и выбор терялся — открытый раздел «исчезал»
+        # из дерева после каждой правки настроек.
+        selected = (("section", select_key) if select_key
+                    else self._current_ref())
         self.tree.clear()
         try:
             if self.project is None:
                 return
             p = self.project
-            # Отслеживаем, какой объект был выбран (для восстановления после перестройки).
-            selected = self._current_ref()
             for entry in p.structure:
                 kind = entry.get("kind")
                 needed = bool(entry.get("needed", True))
                 label = SECTION_LABELS.get(kind, kind)
-                sec = QTreeWidgetItem([label, ""])
+                sec = QTreeWidgetItem([label, str(_section_sheets(p, kind))])
                 sec.setData(0, _NODE_ROLE, "section")
                 sec.setData(0, _SEC_ROLE, kind)
                 sec.setCheckState(0, Qt.Checked if needed else Qt.Unchecked)
-                # дочерние элементы
-                if kind == SECTION_PZ or kind == SECTION_GRAPHIC:
-                    dkind = DocKind(kind)
-                    for d in p.documents_for(dkind):
-                        sec.addChild(self._doc_item(d))
-                elif kind == SECTION_APPENDIX:
-                    for a in p.appendices:
-                        sec.addChild(self._app_item(a))
+                if not needed:
+                    sec.setForeground(0, Qt.gray)
                 self.tree.addTopLevelItem(sec)
-            self.tree.expandAll()
             self._restore_selection(selected)
         finally:
             self._updating = False
@@ -131,6 +148,8 @@ class SheetTree(QWidget):
         item.setData(0, _NODE_ROLE, "doc")
         item.setData(0, _DOC_ROLE, d)
         item.setCheckState(0, Qt.Checked if d.needed else Qt.Unchecked)
+        if not d.needed:
+            item.setForeground(0, Qt.gray)
         return item
 
     def _app_item(self, a: Appendix) -> QTreeWidgetItem:
@@ -141,52 +160,43 @@ class SheetTree(QWidget):
         item.setData(0, _NODE_ROLE, "appendix")
         item.setData(0, _APP_ROLE, a)
         item.setCheckState(0, Qt.Checked if a.needed else Qt.Unchecked)
+        if not a.needed:
+            item.setForeground(0, Qt.gray)
         return item
 
     # ---- навигация по данным ----
     def _current_ref(self):
-        """Возвращает ссылку на текущий выбранный объект (для восстановления)."""
+        """Возвращает ссылку на текущий выбранный раздел (для восстановления)."""
         cur = self.tree.currentItem()
         if cur is None:
             return None
-        node = cur.data(0, _NODE_ROLE)
-        if node == "doc":
-            return ("doc", id(cur.data(0, _DOC_ROLE)))
-        if node == "appendix":
-            return ("appendix", id(cur.data(0, _APP_ROLE)))
         return ("section", cur.data(0, _SEC_ROLE))
 
     def _restore_selection(self, ref) -> None:
+        """Возвращает подсветку выбранного раздела после перестройки дерева.
+
+        Сигналы на время выбора блокируются: иначе повторный выбор запускал бы
+        новую перерисовку предпросмотра и заново заполнял контекстную форму —
+        правка настроек выглядела как «перескок» на начальный вид.
+        """
         if ref is None:
             return
         kind, key = ref
         for i in range(self.tree.topLevelItemCount()):
             sec = self.tree.topLevelItem(i)
-            if kind == "section":
-                if sec.data(0, _SEC_ROLE) == key:
+            if sec.data(0, _SEC_ROLE) == key:
+                self.tree.blockSignals(True)
+                try:
                     self.tree.setCurrentItem(sec)
-                    return
-            else:
-                for j in range(sec.childCount()):
-                    ch = sec.child(j)
-                    if kind == "doc" and id(ch.data(0, _DOC_ROLE)) == key:
-                        self.tree.setCurrentItem(ch)
-                        return
-                    if kind == "appendix" and id(ch.data(0, _APP_ROLE)) == key:
-                        self.tree.setCurrentItem(ch)
-                        return
+                finally:
+                    self.tree.blockSignals(False)
+                return
 
     def _section_kind(self, item) -> str | None:
-        """Ключ раздела, которому принадлежит элемент (сам или родитель)."""
+        """Ключ раздела элемента (в дереве все элементы — разделы)."""
         if item is None:
             return None
-        sec = item.data(0, _SEC_ROLE)
-        if sec:
-            return sec
-        parent = item.parent()
-        if parent is not None:
-            return parent.data(0, _SEC_ROLE)
-        return None
+        return item.data(0, _SEC_ROLE)
 
     def _node_type(self, item) -> str | None:
         if item is None:
@@ -195,46 +205,34 @@ class SheetTree(QWidget):
 
     # ---- выбор листа для предпросмотра ----
     def _on_select(self, cur, prev) -> None:
+        # Во время перестройки дерева выбор не обрабатывается. QTreeWidget при
+        # clear() и наполнении сам двигает currentItem и шлёт currentItemChanged
+        # (в т.ч. с cur=None) — без этой проверки завершение пересчёта и любая
+        # синхронизация проекта перебрасывали предпросмотр на другой раздел
+        # («фокус сбрасывался»). Восстановление выбора делает _restore_selection,
+        # сигналы на это время блокируются.
+        if self._updating:
+            return
         if cur is None:
             return
-        node = cur.data(0, _NODE_ROLE)
-        if node == "doc":
-            d = cur.data(0, _DOC_ROLE)
-            sec = self._section_kind(cur)
+        kind = cur.data(0, _SEC_ROLE)
+        label = SECTION_LABELS.get(kind, kind)
+        # ПЗ/Графика/Приложения и «Состав проектной документации» — предпросмотр
+        # раздела целиком (все листы).
+        if kind in (SECTION_PZ, SECTION_GRAPHIC, SECTION_APPENDIX,
+                    SECTION_COMPOSITION):
             self.selection_changed.emit({
-                "kind": "doc", "section": sec,
-                "section_label": SECTION_LABELS.get(sec, sec),
-                "label": os.path.basename(d.path) if d.path else "—",
-                "path": d.path,
-                "obj": d,
-            })
-        elif node == "appendix":
-            a = cur.data(0, _APP_ROLE)
-            self.selection_changed.emit({
-                "kind": "appendix", "section": SECTION_APPENDIX,
-                "section_label": SECTION_LABELS.get(SECTION_APPENDIX, SECTION_APPENDIX),
-                "label": (a.number + ". " if a.number else "") + a.name,
-                "path": a.file_path, "number": a.number, "name": a.name,
-                "obj": a,
+                "kind": "section", "section": kind,
+                "section_label": label,
+                "label": label,
             })
         else:
-            # раздел
-            kind = cur.data(0, _SEC_ROLE)
-            label = SECTION_LABELS.get(kind, kind)
-            # Для ПЗ/Графики/Приложений — placeholder-предпросмотр раздела.
-            if kind in (SECTION_PZ, SECTION_GRAPHIC, SECTION_APPENDIX):
-                self.selection_changed.emit({
-                    "kind": "section", "section": kind,
-                    "section_label": label,
-                    "label": label,
-                })
-            else:
-                # Листы ГОСТ: cover/title/content/changes (или штампы).
-                self.selection_changed.emit({
-                    "kind": self._gost_kind(kind), "section": kind,
-                    "section_label": label,
-                    "label": label,
-                })
+            # Листы ГОСТ: cover/title/content/changes (или штампы).
+            self.selection_changed.emit({
+                "kind": self._gost_kind(kind), "section": kind,
+                "section_label": label,
+                "label": label,
+            })
 
     def _gost_kind(self, section_kind: str) -> str:
         """Сопоставляет ключ раздела с листом предпросмотра ГОСТ."""
@@ -253,56 +251,38 @@ class SheetTree(QWidget):
         if self._updating or self.project is None or column != 0:
             return
         checked = item.checkState(0) == Qt.Checked
-        node = item.data(0, _NODE_ROLE)
-        if node == "doc":
-            item.data(0, _DOC_ROLE).needed = checked
-        elif node == "appendix":
-            item.data(0, _APP_ROLE).needed = checked
-        elif node == "section":
-            kind = item.data(0, _SEC_ROLE)
-            for entry in self.project.structure:
-                if entry.get("kind") == kind:
-                    entry["needed"] = checked
-                    break
+        kind = item.data(0, _SEC_ROLE)
+        for entry in self.project.structure:
+            if entry.get("kind") == kind:
+                entry["needed"] = checked
+                break
+        # Исключённый раздел остаётся в дереве, но помечается серым.
+        item.setForeground(0, Qt.black if checked else Qt.gray)
+        self.item_modified.emit()
 
     # ---- действия ----
     def _delete(self) -> None:
+        """Удаление из дерева недоступно: здесь только разделы тома."""
         if self.project is None:
             return
         cur = self.tree.currentItem()
         if cur is None:
             return
-        if cur.parent() is None:
-            QMessageBox.information(self, "Выберите элемент",
-                                    "Удаление раздела невозможно. Выделите документ или приложение.")
-            return
-        if QMessageBox.question(self, "Удалить", f"Удалить «{cur.text(0)}»?") == QMessageBox.Yes:
-            node = cur.data(0, _NODE_ROLE)
-            if node == "doc":
-                d = cur.data(0, _DOC_ROLE)
-                if d in self.project.documents:
-                    self.project.documents.remove(d)
-            elif node == "appendix":
-                a = cur.data(0, _APP_ROLE)
-                if a in self.project.appendices:
-                    self.project.appendices.remove(a)
-            self._refresh()
+        kind = cur.data(0, _SEC_ROLE)
+        QMessageBox.information(
+            self, "Удаление недоступно",
+            f"Раздел «{SECTION_LABELS.get(kind, kind)}» удалить нельзя — "
+            "структура тома задаётся порядком разделов (кнопки «Вверх»/«Вниз»).\n\n"
+            "Документы и приложения удаляются в контекстной панели справа.")
 
     def _move(self, delta: int) -> None:
-        """Перемещает выбранный элемент вверх/вниз.
-        Разделы — в пределах структуры тома; документы/приложения — в пределах своего раздела."""
+        """Перемещает выбранный раздел вверх/вниз по структуре тома."""
         if self.project is None:
             return
         cur = self.tree.currentItem()
         if cur is None:
             return
-        node = cur.data(0, _NODE_ROLE)
-        if node == "section":
-            self._move_section(cur, delta)
-        elif node == "doc":
-            self._move_doc(cur, delta)
-        elif node == "appendix":
-            self._move_appendix(cur, delta)
+        self._move_section(cur, delta)
 
     def _move_section(self, item, delta: int) -> None:
         p = self.project
@@ -315,30 +295,8 @@ class SheetTree(QWidget):
             return
         p.structure[idx], p.structure[new_idx] = p.structure[new_idx], p.structure[idx]
         self._refresh(select_key=kind)
-
-    def _move_doc(self, item, delta: int) -> None:
-        p = self.project
-        d = item.data(0, _DOC_ROLE)
-        kind = d.doc_kind
-        group = [x for x in p.documents if x.doc_kind == kind]
-        idx = group.index(d)
-        new_idx = idx + delta
-        if new_idx < 0 or new_idx >= len(group):
-            return
-        # Переставляем в общем списке documents.
-        pos = p.documents.index(d)
-        other = group[new_idx]
-        pos_other = p.documents.index(other)
-        p.documents[pos], p.documents[pos_other] = p.documents[pos_other], p.documents[pos]
-        self._refresh(select_key=kind)
-
-    def _move_appendix(self, item, delta: int) -> None:
-        p = self.project
-        a = item.data(0, _APP_ROLE)
-        idx = p.appendices.index(a)
-        new_idx = idx + delta
-        if new_idx < 0 or new_idx >= len(p.appendices):
-            return
-        p.appendices[idx], p.appendices[new_idx] = p.appendices[new_idx], p.appendices[idx]
-        self._refresh(select_key=SECTION_APPENDIX)
+        # Выбор раздела после перестройки восстанавливается без сигналов,
+        # поэтому о смене порядка сообщаем явно — иначе предпросмотр и
+        # нумерация листов остались бы от прежнего порядка.
+        self.item_modified.emit()
 

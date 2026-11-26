@@ -32,7 +32,7 @@ from ..models import (
     VolumeProject, DocKind,
     SECTION_COVER, SECTION_TITLE, SECTION_CONTENT,
     SECTION_PZ, SECTION_GRAPHIC, SECTION_APPENDIX, SECTION_CHANGES,
-    SECTION_LABELS,
+    SECTION_COMPOSITION, SECTION_LABELS, section_designation,
 )
 
 
@@ -149,6 +149,21 @@ def appendix_sheet_count(a) -> int:
     return max(1, pages) if pages else _pdf_count(f)
 
 
+def composition_sheet_count(project) -> int:
+    """Число листов раздела «Состав проектной документации» (минимум 1).
+
+    Пагинация таблицы (сколько строк входит на лист формы 5 / формы 6) —
+    в едином источнике preview_html.composition_pages: по нему же строятся
+    предпросмотр, Word и PDF, поэтому номера листов в содержании совпадают.
+    Раздел занимает лист даже с пустой таблицей — на нём видна шапка таблицы.
+    """
+    try:
+        from .preview_html import composition_pages
+        return max(1, len(composition_pages(project)))
+    except Exception:
+        return 1
+
+
 # --- Карта листов (линейная нумерация) ------------------------------------------
 
 @dataclass
@@ -176,7 +191,7 @@ class ContentItem:
 
     @property
     def sheet_label(self) -> str:
-        """«Лист N», «Лист N — M» или «—»."""
+        """Номер первого листа позиции («N»); для диапазона — «N-M» (0 — «—»)."""
         if self.count <= 0:
             return "—"
         return f"{self.first_sheet}-{self.last_sheet}" if self.count > 1 else str(self.first_sheet)
@@ -214,15 +229,15 @@ def doc_label(d) -> str:
     return os.path.basename(p) if p else "—"
 
 
-def appendix_label(a) -> str:
-    """Наименование приложения (номер + название)."""
-    number = getattr(a, "number", "") or ""
-    name = getattr(a, "name", "") or ""
-    if number and name:
-        return f"Приложение {number}. {name}"
-    if number:
-        return f"Приложение {number}"
-    return name or "Приложение"
+def appendix_designation(a) -> str:
+    """Обозначение приложения для графы «Обозначение» содержания.
+
+    По ГОСТ Р 21.101-2020 в этой графе у приложения пишется его номер со
+    словом «Приложение»: «Приложение 1», «Приложение А». Без номера остаётся
+    просто «Приложение».
+    """
+    number = (getattr(a, "number", "") or "").strip()
+    return f"Приложение {number}" if number else "Приложение"
 
 
 def build_layout(project: VolumeProject) -> VolumeLayout:
@@ -235,6 +250,10 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
     sheet = 1                       # текущий сквозной номер листа
     req = project.requisites
     volume_id = req.volume_id or ""
+
+    def design(kind: str) -> str:
+        """Обозначение раздела: обозначение тома + доп. обозначение раздела."""
+        return section_designation(project, kind)
 
     def _sections_in_order():
         for entry in project.structure:
@@ -258,6 +277,19 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
                 designation=volume_id, first_sheet=0, last_sheet=0, count=0,
                 kind="title", section_key=SECTION_TITLE, is_section_header=True))
             continue
+        if kind == SECTION_COMPOSITION:
+            # Состав проектной документации: листы с рамкой и основной надписью
+            # формы 5 (первый) и формы 6 (последующие). Раздел занимает лист
+            # даже с пустой таблицей — на нём видна шапка таблицы.
+            n = composition_sheet_count(project)
+            layout.items.append(ContentItem(
+                title=SECTION_LABELS.get(SECTION_COMPOSITION,
+                                         "Состав проектной документации"),
+                designation=design(SECTION_COMPOSITION), first_sheet=sheet,
+                last_sheet=sheet + n - 1, count=n, kind="composition",
+                section_key=SECTION_COMPOSITION, is_section_header=True))
+            sheet += n
+            continue
         if kind == SECTION_CONTENT:
             # Содержание — первый нумерованный лист тома (№1).
             first = sheet
@@ -265,7 +297,7 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
             sheet += layout.content_sheets
             layout.items.append(ContentItem(
                 title=SECTION_LABELS.get(SECTION_CONTENT, "Содержание"),
-                designation=volume_id, first_sheet=first,
+                designation=design(SECTION_CONTENT), first_sheet=first,
                 last_sheet=first + layout.content_sheets - 1,
                 count=layout.content_sheets, kind="content",
                 section_key=SECTION_CONTENT, is_section_header=True))
@@ -273,12 +305,10 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
         if kind == SECTION_PZ:
             docs = project.documents_for(DocKind.POYASNITELNAYA)
             if not docs:
-                # Раздел без документов — одна строка-заглушка занимает 1 лист.
-                layout.items.append(ContentItem(
-                    title=SECTION_LABELS.get(SECTION_PZ, "Пояснительная записка"),
-                    designation=volume_id, first_sheet=sheet, last_sheet=sheet, count=1,
-                    kind="pz", section_key=SECTION_PZ, is_section_header=True))
-                sheet += 1
+                # В разделе нет включённых документов: он не занимает лист и не
+                # попадает в содержание. Иначе после снятия флажка «в сборку»
+                # у документа оставался бы пустой лист-заглушка, и том выглядел
+                # бы так, будто документ не исключён.
                 continue
             # Автоматическое оглавление записки (app.core.pz_toc) занимает свои
             # листы ПЕРЕД первым документом раздела и также входит в «Листов M».
@@ -294,7 +324,7 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
                 ff = forms[index] if index < len(forms) else 2
                 n = doc_sheet_count(d, first_form=ff) + (toc_sheets if index == 0 else 0)
                 layout.items.append(ContentItem(
-                    title=doc_label(d), designation=volume_id,
+                    title=doc_label(d), designation=design(SECTION_PZ),
                     first_sheet=sheet, last_sheet=sheet + n - 1, count=n,
                     kind="pz", section_key=SECTION_PZ, is_section_header=False))
                 sheet += n
@@ -302,18 +332,27 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
         if kind == SECTION_GRAPHIC:
             docs = project.documents_for(DocKind.GRAPHIC)
             if not docs:
-                layout.items.append(ContentItem(
-                    title=SECTION_LABELS.get(SECTION_GRAPHIC, "Графическая часть"),
-                    designation=volume_id, first_sheet=sheet, last_sheet=sheet, count=1,
-                    kind="graphic", section_key=SECTION_GRAPHIC, is_section_header=True))
-                sheet += 1
+                # См. ПЗ: без включённых документов раздел не занимает лист.
                 continue
+            # Лист «Графическая часть» с перечнем листов идёт ПЕРВЫМ листом
+            # раздела (если включён в настройках), поэтому сдвигает нумерацию
+            # всех листов графики: без этого содержание разошлось бы с
+            # предпросмотром и с самим томом.
+            gl = getattr(project, "graphic_sheet_list", None)
+            if gl is not None and gl.enabled:
+                layout.items.append(ContentItem(
+                    title="Графическая часть. Перечень листов",
+                    designation=design(SECTION_GRAPHIC),
+                    first_sheet=sheet, last_sheet=sheet, count=1,
+                    kind="graphic", section_key=SECTION_GRAPHIC,
+                    is_section_header=False))
+                sheet += 1
             for d in docs:
                 # В разделе графики первый лист документа тоже рисуется
                 # с формы 6 (first=False в дереве) — та же модель высот.
                 n = doc_sheet_count(d, first_form="2a")
                 layout.items.append(ContentItem(
-                    title=doc_label(d), designation=volume_id,
+                    title=doc_label(d), designation=design(SECTION_GRAPHIC),
                     first_sheet=sheet, last_sheet=sheet + n - 1, count=n,
                     kind="graphic", section_key=SECTION_GRAPHIC, is_section_header=False))
                 sheet += n
@@ -324,9 +363,12 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
                 continue
             for a in apps:
                 n = appendix_sheet_count(a)
+                design = appendix_designation(a)
                 layout.items.append(ContentItem(
-                    title=appendix_label(a),
-                    designation=(a.number or ""),
+                    # Наименование строки содержания — название приложения;
+                    # номер вынесен в графу «Обозначение» («Приложение 1»).
+                    title=(getattr(a, "name", "") or "").strip() or design,
+                    designation=design,
                     first_sheet=sheet, last_sheet=sheet + n - 1, count=n,
                     kind="appendix", section_key=SECTION_APPENDIX, is_section_header=False))
                 sheet += n
@@ -371,23 +413,70 @@ def content_rows(project: VolumeProject) -> list:
     тома); сквозная нумерация при этом сохраняется как была.
     Ручной перечень requisites.sections добавляется как дополнительный блок,
     если он заполнен и не дублирует автоматические разделы.
+
+    В содержании — РАЗДЕЛЫ тома: документы внутри раздела объединяются в одну
+    строку. Исключение — приложения: каждое идёт ОТДЕЛЬНОЙ строкой, потому что
+    у него своё обозначение («Приложение 1», «Приложение 2») и своё название.
+    В графе «Листы» стоит номер ПЕРВОГО листа строки (без слов «Лист»/«Листы»
+    и без диапазона) — так требует ГОСТ Р 21.101-2020. Таким образом содержание
+    отражает состав тома, а не перечень файлов.
     """
     items = build_content_items(project)
+    # Строки собираются списком словарей: у приложений своё наименование и
+    # обозначение, поэтому ключ группировки и подпись строки хранятся раздельно.
     rows = []
     for it in items:
         # Обложка (cover) и титульный лист (title) не входят в содержание.
         if it.kind in ("cover", "title"):
             continue
-        rows.append((it.title, it.designation, it.sheet_label))
+        # Позиции одного раздела склеиваются в одну строку: у ПЗ/графики это
+        # несколько документов + лист перечня, в содержании они — один раздел.
+        key = it.section_key or it.kind
+        if it.kind == "appendix":
+            # Каждое приложение — своя строка: ключ уникален, поэтому условие
+            # склейки ниже для них не срабатывает.
+            rows.append({"key": f"{key}#{len(rows)}", "title": it.title,
+                         "designation": it.designation or "",
+                         "label": it.sheet_label, "last": it.last_sheet})
+            continue
+        if rows and rows[-1]["key"] == key:
+            # Диапазон расширяется до последнего листа раздела.
+            rows[-1]["last"] = max(rows[-1]["last"], it.last_sheet)
+            continue
+        rows.append({"key": key, "title": _row_title(key),
+                     "designation": it.designation or "",
+                     "label": it.sheet_label, "last": it.last_sheet})
     # Ручные строки из реквизитов (если заданы) — после автоматических.
+    manual = []
     for s in project.requisites.sections or []:
         s = s.strip()
         if not s:
             continue
-        if any(r[0] == s for r in rows):
+        if any(r["designation"] == s or r["title"] == s for r in rows):
             continue
-        rows.append((s, "", "—"))
-    return rows
+        manual.append((s, "", "—"))
+    return [(r["title"], r["designation"], _row_sheets(r["label"], r["last"]))
+            for r in rows] + manual
+
+
+def _row_title(key: str) -> str:
+    """Наименование раздела для строки содержания (ключ -> подпись)."""
+    return SECTION_LABELS.get(key, key)
+
+
+def _row_sheets(label: str, last: int) -> str:
+    """Графа «Листы» строки содержания: номер ПЕРВОГО листа строки.
+
+    По ГОСТ Р 21.101-2020 в графе указывается только номер листа, с которого
+    начинается раздел, — без слов «Лист»/«Листы» и без диапазона: «3», а не
+    «Листы 3 — 10». Для не занимающих лист позиций (обложка, титул) — «—».
+    """
+    if not last:
+        return "—"
+    # Первый лист — из метки позиции («N» / «N-M»).
+    import re
+    m = re.search(r"(\d+)", label or "")
+    return m.group(1) if m else (label or "—")
 
 
 def total_sheets(project: VolumeProject) -> int:

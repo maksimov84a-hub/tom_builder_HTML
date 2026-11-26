@@ -3,11 +3,19 @@
 ## Контекст проекта
 
 - Проект: десктопное Windows-приложение для сборки тома проектной документации по ГОСТ Р 21.101-2020.
-- Стек: Python 3.12, PySide6/Qt, QWebEngineView + QWebChannel, python-docx, PyMuPDF, pywin32/Word COM.
+- Стек: **Python 3.12 (64-бит)** — обязательно, см. PYTHON.md; PySide6/Qt, QWebEngineView + QWebChannel, python-docx, PyMuPDF, pywin32/Word COM.
 - Точка входа: main.py.
 - Основная спецификация и актуальные решения: SPEC.md.
-- Пакет приложения: app/; зависимости поставляются в vendor/.
+- Требования к окружению (версия Python, почему именно 3.12): PYTHON.md.
+- Пакет приложения: app/; зависимости поставляются в vendor/ и собраны под CPython 3.12.
 - Временные результаты, изображения и логи находятся в tmp/.
+
+## Запуск и версия Python
+
+- Запуск: `run.bat` (ищет Python 3.12: `%TOM_PYTHON%` → `py -3.12` → типичные пути) или `py -3.12 main.py`.
+- **Зависимости в `vendor/` собраны под CPython 3.12** (`lxml/etree.cp312-win_amd64.pyd`, `pywin32` cp312). На другой версии Python импорт lxml падает с `ImportError: cannot import name 'etree'`, из-за чего не загружается python-docx и **DOCX не отображается в предпросмотре** (PySide6 и PyMuPDF работают — они abi3, поэтому PDF показывается).
+- Не «лечить» это обходными парсерами DOCX: правильное решение — запуск на Python 3.12. Признак неверной версии — «Не удалось отобразить содержимое файла» на листе записки и `ImportError ... lxml` в `tmp/build.log`.
+- Проверка окружения: `py -3.12 -c "import docx, pymupdf, PySide6; print('OK')"`.
 
 ## Как начинать новую сессию
 

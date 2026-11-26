@@ -24,6 +24,8 @@ class PreviewBridge(QObject):
     signature_clicked = Signal(str)         # (key)
     sheet_ready = Signal()
     zoom_changed = Signal(float)            # (scale)
+    scroll_changed = Signal(float)          # (положение прокрутки, px)
+    active_sheet_changed = Signal(int)      # (индекс активного листа)
 
     @Slot(str, str)
     def onFieldChanged(self, key: str, value: str) -> None:
@@ -51,3 +53,13 @@ class PreviewBridge(QObject):
     @Slot(float)
     def onZoomChanged(self, scale: float) -> None:
         self.zoom_changed.emit(scale)
+
+    @Slot(float)
+    def onScrollChanged(self, position: float) -> None:
+        """Положение прокрутки страницы предпросмотра (px от начала)."""
+        self.scroll_changed.emit(float(position))
+
+    @Slot(int)
+    def onActiveSheet(self, index: int) -> None:
+        """Сменился активный лист (тот, что занимает большую часть окна)."""
+        self.active_sheet_changed.emit(int(index))

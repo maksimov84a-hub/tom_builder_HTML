@@ -1,0 +1,37 @@
+{
+  "font_name": "ISOCPEUR",
+  "margins": {
+    "left": 20.0,
+    "right": 5.0,
+    "top": 5.0,
+    "bottom": 5.0
+  },
+  "font_map": {
+    "title_doc_name": 18,
+    "stamp_volume": 14,
+    "stamp_qty": 12,
+    "stamp_columns": 10,
+    "content_header": 14,
+    "content_row": 12,
+    "toc_row": 12,
+    "text_body": 14,
+    "text_heading": 14,
+    "appendix_header": 12,
+    "signature": 10
+  },
+  "toc_enabled": true,
+  "paragraph_indent_chars": 5.0,
+  "text_fonts": {
+    "body_font": "ISOCPEUR",
+    "body_size": 12,
+    "heading_font": "ISOCPEUR",
+    "heading_size": 14,
+    "table_font": "ISOCPEUR",
+    "table_size": 10
+  },
+  "build_formats": [
+    "docx"
+  ],
+  "build_docx_chapters": true,
+  "stamp_panel_open": false
+}

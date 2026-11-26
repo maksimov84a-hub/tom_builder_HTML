@@ -18,9 +18,9 @@ import os
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout,
-    QFileDialog, QMessageBox, QSplitter, QDialog,
+    QFileDialog, QMessageBox, QSplitter, QDialog, QProgressBar, QLabel,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QEvent, QTimer, QThread, Slot
 from PySide6.QtGui import QAction, QKeySequence
 
 from ..models import VolumeProject
@@ -39,6 +39,9 @@ class MainWindow(QMainWindow):
         self.project = project or VolumeProject()
         self._current_file: str | None = None   # путь к JSON-проекту
         self._current_sheet: dict = {"kind": "cover"}   # текущий лист предпросмотра
+        #: DOCX, у которых текст правили, но число листов ещё не пересчитано
+        #: (пересчёт занимает около секунды — откладываем до первой нужды).
+        self._pages_dirty: set = set()
         self.setWindowTitle("Сборка тома по ГОСТ Р 21.101-2020")
 
         central = QWidget()
@@ -48,16 +51,54 @@ class MainWindow(QMainWindow):
         # ---- Левая панель: дерево листов (структура тома) ----
         self.sheet_tree = SheetTree()
         self.sheet_tree.selection_changed.connect(self._on_sheet_selected)
+        self.sheet_tree.item_modified.connect(self._on_structure_changed)
 
         # ---- Центр: HTML-предпросмотр ----
         self.preview = SheetPreview()
         self.preview.field_changed.connect(self._on_field_changed)
         self.preview.signature_clicked.connect(self._on_signature_clicked)
         self.preview.save_pz_requested.connect(self._save_pz_edits)
+        # Автосохранение: правка ПЗ сама уходит в связанный DOCX.
+        self.preview.autosave_requested.connect(self._on_pz_autosave)
+        self.preview.repaginate_requested.connect(self._start_word_repagination)
+        self.preview.paragraph_changed.connect(self._mark_pagination_stale)
+        self.preview.cell_changed.connect(self._mark_pagination_stale)
+        self._pagination_stale: set = set()
+        self._pagination_invalidated_at: dict = {}
+        self._pagination_layouts: dict = {}
+        self._pagination_threads: dict = {}
+        self._pagination_busy: set = set()
+        self._pagination_job_id = 0
+        self._pagination_paths_by_job: dict = {}
+        self._pagination_thread_by_job: dict = {}
+        self._pagination_errors: dict = {}
+        self._pagination_status_label = QLabel("ПЗ: не рассчитана")
+        self._pagination_progress = QProgressBar()
+        self._pagination_progress.setRange(0, 0)
+        self._pagination_progress.setFixedWidth(110)
+        self._pagination_progress.setFixedHeight(12)
+        self._pagination_progress.setTextVisible(False)
+        self._pagination_progress.hide()
+        self.statusBar().addPermanentWidget(self._pagination_status_label)
+        self.statusBar().addPermanentWidget(self._pagination_progress)
 
         # ---- Правая панель: контекстные настройки (вместо вкладок) ----
         self.context = ContextPanel(project=self.project)
         self.context.item_modified.connect(self._on_item_modified)
+        self.context.edit_pz_requested.connect(self._open_pz_editor)
+
+        # ---- Нижняя панель: основная надпись активного листа (масштаб 100%) ----
+        from .stamp_panel import StampPanel
+        self.stamp_panel = StampPanel()
+        self.stamp_panel.restore_state()
+        self.preview.stamps_changed.connect(self.stamp_panel.set_stamps)
+        self.preview.active_stamp_changed.connect(self.stamp_panel.set_active)
+        # Поля панели правятся теми же обработчиками, что и на самом листе:
+        # правка уходит в модель проекта, подпись выбирается по клику.
+        # Сохранение в панели — по потере фокуса, поэтому после записи листы
+        # можно перерисовать: обновляются все связанные штампы.
+        self.stamp_panel.field_changed.connect(self._on_panel_field_changed)
+        self.stamp_panel.signature_clicked.connect(self._on_signature_clicked)
 
         # ---- Компоновка ----
         splitter = QSplitter(Qt.Horizontal)
@@ -72,6 +113,7 @@ class MainWindow(QMainWindow):
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(2, False)
         root.addWidget(splitter, stretch=1)
+        root.addWidget(self.stamp_panel)
 
         # ---- Главное меню (кнопки проекта вынесены наверх как меню) ----
         self._build_menu()
@@ -88,6 +130,53 @@ class MainWindow(QMainWindow):
             self._was_maximized = True
             self.showMaximized()
 
+    def changeEvent(self, event) -> None:
+        """Возврат в окно: отдаём фокус обратно в предпросмотр.
+
+        После переключения в другую программу и обратно клавиатура и мышь
+        могли «залипнуть»: активным элементом оставалось поле внутри
+        QWebEngineView, которое потеряло фокус на уровне Windows. Возврат
+        активирует окно и заново ставит фокус на тот виджет, который был
+        активен, — иначе кнопки и поля в окне не реагируют.
+        """
+        super().changeEvent(event)
+        if event.type() == QEvent.ActivationChange and self.isActiveWindow():
+            self._restore_input_focus()
+
+    def _restore_input_focus(self) -> None:
+        """Восстанавливает фокус ввода после возврата в окно (см. changeEvent)."""
+        if not self.isActiveWindow():
+            return
+
+        def apply() -> None:
+            if not self.isActiveWindow():
+                return
+            widget = self.focusWidget()
+            # Фокус мог остаться на скрытом/неактивном виджете — тогда берём
+            # предпросмотр: он занимает центр окна.
+            if widget is None or not widget.isVisible() or not widget.isEnabled():
+                widget = self.preview
+            try:
+                widget.setFocus(Qt.OtherFocusReason)
+            except Exception:
+                pass
+            # Странице WebEngine нужен явный «щелчок фокуса»: без него
+            # обработчики ввода в HTML не оживают до реального клика.
+            view = getattr(self.preview, "view", None)
+            if view is not None:
+                view.setFocus(Qt.OtherFocusReason)
+                try:
+                    view.page().runJavaScript(
+                        "window.focus(); if (document.body) {"
+                        "document.body.dispatchEvent("
+                        "new Event('focus', {bubbles: true})); }")
+                except Exception:
+                    pass
+
+        # Небольшая задержка: Windows отдаёт фокус окну уже после события.
+        QTimer.singleShot(60, apply)
+        QTimer.singleShot(220, apply)
+
     def _confirm_pending_pz_edits(self, action: str) -> bool:
         """Спрашивает о несохранённых правках ПЗ перед действием.
 
@@ -95,6 +184,11 @@ class MainWindow(QMainWindow):
         решил продолжить). Если пользователь выбрал «Сохранить» — правки
         записываются, и возвращается True при успехе.
         """
+        # Сначала дописываем то, что ещё ждёт паузы автосохранения: обычно
+        # после этого несохранённых правок не остаётся и вопрос не нужен.
+        self.preview.flush_autosave()
+        # Число листов понадобится сборке — пересчитываем отложенное.
+        self._refresh_dirty_pages()
         if not self.preview.has_pz_edits():
             return True
         answer = QMessageBox.question(
@@ -162,38 +256,82 @@ class MainWindow(QMainWindow):
         self._recent_menu = menu_bar.addMenu("&Недавние")
         self._rebuild_recent_menu()
 
-        # Пункты сборки — отдельными элементами в строке меню (без подменю).
-        act_build = QAction("&Собрать том…", self)
+        # «Сборка» — не выпадающее меню, а пункт строки меню: нажатие сразу
+        # открывает окно сборки (форматы + «Отмена» / «Собрать»). Промежуточного
+        # подменю с единственным пунктом «Собрать том…» больше нет.
+        act_build = QAction("&Сборка", self)
+        act_build.setToolTip("Открыть окно сборки тома")
+        act_build.setShortcut(QKeySequence("Ctrl+B"))
         act_build.triggered.connect(self._build)
         menu_bar.addAction(act_build)
 
-        act_build_html = QAction("Собрать том в &HTML…", self)
-        act_build_html.triggered.connect(self._build_html_volume)
-        menu_bar.addAction(act_build_html)
+        # Настройки оформления текста ПЗ: шрифт и кегль по группам.
+        settings_menu = menu_bar.addMenu("&Настройки")
+        act_fonts = QAction("&Шрифты текста ПЗ…", self)
+        act_fonts.triggered.connect(self._open_text_fonts)
+        settings_menu.addAction(act_fonts)
 
-        act_build_pdf = QAction("Экспорт HTML → &PDF…", self)
-        act_build_pdf.triggered.connect(self._build_html_pdf_volume)
-        menu_bar.addAction(act_build_pdf)
+    # ---- Форматы сборки (окно «Собрать том») ----
+    #: Форматы тома в порядке флажков окна: (ключ, подпись).
+    BUILD_FORMATS = (
+        ("pdf", "PDF (*.pdf)"),
+        ("docx", "DOC — Word (*.docx)"),
+        ("html", "HTML (*.html)"),
+    )
 
-        # Сборка раздела — только через меню (кнопки из панелей убраны).
-        act_build_section = QAction("&Собрать раздел…", self)
-        act_build_section.triggered.connect(self._on_build_section_current)
-        menu_bar.addAction(act_build_section)
+    def _saved_build_formats(self) -> list:
+        """Форматы из config.json (пустой/битый набор — все форматы)."""
+        from ..config import load_config
+        try:
+            saved = load_config().build_formats
+        except Exception:
+            saved = None
+        if not saved:
+            saved = [key for key, _label in self.BUILD_FORMATS]
+        keys = {key for key, _label in self.BUILD_FORMATS}
+        return [key for key in saved if key in keys] or [
+            key for key, _label in self.BUILD_FORMATS]
 
-        act_build_section_html = QAction("Собрать раздел в &HTML…", self)
-        act_build_section_html.triggered.connect(self._build_html_section)
-        menu_bar.addAction(act_build_section_html)
+    def _save_build_formats(self, chosen: list, chapters: bool | None = None) -> None:
+        """Запоминает выбранный набор в config.json (пустой не пишется)."""
+        if not chosen:
+            return
+        from ..config import load_config, save_config
+        try:
+            cfg = load_config()
+        except Exception:
+            return
+        cfg.build_formats = list(chosen)
+        if chapters is not None:
+            cfg.build_docx_chapters = bool(chapters)
+        try:
+            save_config(cfg)
+        except Exception:
+            # Не удалось записать файл — набор остаётся действующим до выхода.
+            pass
 
-        # Редактирование пояснительной записки — из окна программы.
-        act_edit_pz = QAction("&Редактировать пояснительную записку…", self)
-        act_edit_pz.triggered.connect(self._edit_current_pz)
-        menu_bar.addAction(act_edit_pz)
+    def _ask_build_formats(self) -> tuple | None:
+        """Показывает окно выбора форматов.
 
-        self._actions = {
-            "new": act_new, "open": act_open,
-            "save": act_save, "save_as": act_save_as,
-            "build": act_build,
-        }
+        Возвращает (форматы, «по разделам»); None — пользователь отменил.
+        """
+        from PySide6.QtWidgets import QDialog
+        from .build_dialog import BuildDialog
+        from ..config import load_config
+        try:
+            chapters = bool(load_config().build_docx_chapters)
+        except Exception:
+            chapters = False
+        dlg = BuildDialog(self, self._saved_build_formats(), chapters=chapters)
+        # Сравнение идёт с QDialog.Accepted: у ЭКЗЕМПЛЯРА диалога атрибута
+        # Accepted нет, и `dlg.Accepted` падал с AttributeError — слот
+        # обрывался, поэтому нажатие «Собрать» ничего не делало.
+        if dlg.exec() != QDialog.Accepted:
+            return None
+        chosen = dlg.selected_formats()
+        chapters = dlg.chapters()
+        self._save_build_formats(chosen, chapters)
+        return chosen, chapters
 
     # ---- Недавние файлы ----
     RECENT_MAX = 5
@@ -307,9 +445,17 @@ class MainWindow(QMainWindow):
     def _load_project_into_forms(self) -> None:
         # Правки ПЗ предыдущего проекта к новому отношения не имеют.
         self.preview.clear_pz_edits()
+        self._pagination_stale.clear()
+        self._pagination_invalidated_at.clear()
+        self._pagination_layouts.clear()
+        self._pagination_errors.clear()
+        self._set_pagination_status("не рассчитана")
+        from ..core.word_pagination import invalidate_docx_pages
+        invalidate_docx_pages()
         self.context.load_project(self.project)
         self.sheet_tree.set_project(self.project)
         self._refresh_preview()
+        QTimer.singleShot(0, lambda: self._start_word_repagination(force=False))
 
     def _collect_forms(self) -> None:
         self.context.collect(self.project)
@@ -317,28 +463,292 @@ class MainWindow(QMainWindow):
     # ---- Предпросмотр ----
     def _refresh_preview(self) -> None:
         snapshot = build_preview_snapshot(self.project)
+        current_path = self._current_sheet.get("path", "")
+        pz_section = self._current_sheet.get("section") == "Пояснительная записка"
+        paths = self._current_pz_paths() if pz_section else []
+        self._load_cached_pagination_layouts(paths)
+        snapshot["word_pagination"] = {
+            p: self._pagination_layouts[p] for p in paths
+            if p in self._pagination_layouts and p not in self._pagination_stale
+        }
+        snapshot["pagination_stale"] = any(p in self._pagination_stale for p in paths)
+        snapshot["pagination_busy"] = any(p in self._pagination_busy for p in paths)
+        snapshot["pagination_error"] = self._pagination_errors.get(current_path, "")
         # Клеймим снимок метаданными текущего листа (для заглушек документов/приложений).
         if self._current_sheet.get("kind") in ("doc", "appendix", "section"):
             snapshot["label"] = self._current_sheet.get("label", "")
             snapshot["section_label"] = self._current_sheet.get("section_label", "")
             snapshot["path"] = self._current_sheet.get("path", "")
-            snapshot["section"] = self._current_sheet.get("section", "")
+        # Раздел нужен ВСЕМ листам: по нему адресуются правки ячеек штампа
+        # (таблица изменений и даты подписей). Без него ключ правки получал
+        # пустой раздел, и значение не попадало в модель проекта.
+        snapshot["section"] = self._current_sheet.get("section", "")
         # Показываются ВСЕ листы выбранного пункта (документ/раздел — постранично).
         self.preview.show_sheet(self._current_sheet.get("kind", "cover"),
                                 snapshot, project=self.project)
 
+    def _load_cached_pagination_layouts(self, paths: list[str]) -> None:
+        from ..core.word_pagination import cached_docx_pages
+        for path in paths:
+            if path in self._pagination_layouts or path in self._pagination_stale:
+                continue
+            layout = cached_docx_pages(path, self._first_form_for_path(path))
+            if layout is not None:
+                self._pagination_layouts[path] = layout
+
+    def _current_pz_paths(self) -> list[str]:
+        from ..models import DocKind
+        return [d.path for d in self.project.documents_for(DocKind.POYASNITELNAYA)
+                if d.path and os.path.isfile(d.path)]
+
+    def _first_form_for_path(self, path: str):
+        from ..core.preview_html import pz_doc_first_form
+        return pz_doc_first_form(self.project, path)
+
+    def _cached_word_layout(self, path: str, first_form):
+        from ..core.word_pagination import cached_docx_pages
+        return cached_docx_pages(path, first_form)
+
+    def _mark_pagination_stale(self, *_args) -> None:
+        paths = set(self._current_pz_paths())
+        path = next((value for value in _args if isinstance(value, str) and value in paths), "")
+        if path:
+            self._pagination_stale.add(path)
+            self._pagination_invalidated_at[path] = os.stat(path).st_mtime_ns if os.path.exists(path) else 0
+            self._pagination_layouts.pop(path, None)
+            from ..core.word_pagination import invalidate_docx_pages
+            invalidate_docx_pages(path)
+        else:
+            paths = self._current_pz_paths()
+            self._pagination_stale.update(paths)
+            for item in paths:
+                self._pagination_invalidated_at[item] = os.stat(item).st_mtime_ns
+                self._pagination_layouts.pop(item, None)
+            from ..core.word_pagination import invalidate_docx_pages
+            invalidate_docx_pages()
+        paths = self._current_pz_paths()
+        self.preview.set_pagination_state(
+            stale=any(p in self._pagination_stale for p in paths),
+            busy=any(p in self._pagination_busy for p in paths))
+        self._pagination_status_for_current()
+
+    def _start_word_repagination(self, force: bool = True) -> None:
+        paths = self._current_pz_paths()
+        if self.preview.has_pz_edits():
+            self.preview.flush_autosave()
+        pending = [(path, self._first_form_for_path(path)) for path in paths
+                   if path not in self._pagination_busy and
+                   (force or path in self._pagination_stale or
+                    self._cached_word_layout(path, self._first_form_for_path(path)) is None)]
+        if not pending:
+            self._pagination_status_for_current()
+            return
+        from .pagination_worker import PaginationWorker
+        self._pagination_job_id += 1
+        job_id = self._pagination_job_id
+        thread = QThread(self)
+        worker = PaginationWorker(job_id, pending)
+        worker.moveToThread(thread)
+        worker.progress.connect(self._on_pagination_progress)
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(self._word_repagination_finished)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        key = id(thread)
+        self._pagination_threads[key] = (thread, worker)
+        self._pagination_paths_by_job[job_id] = [path for path, _ in pending]
+        self._pagination_thread_by_job[job_id] = thread
+        self._pagination_busy.update(path for path, _ in pending)
+        self.preview.set_pagination_state(
+            stale=any(path in self._pagination_stale for path, _ in pending),
+            busy=True)
+        self._set_pagination_status("Пересчитывается — подготовка DOCX…", busy=True)
+        self.preview.set_pagination_state(
+            stale=bool(self._pagination_stale), busy=True,
+            message="Подготовка нормализованной копии DOCX…")
+        thread.start()
+
+    @Slot(str)
+    def _on_pagination_progress(self, message: str) -> None:
+        self._set_pagination_status(message, busy=True)
+        self.preview.set_pagination_state(
+            stale=bool(self._pagination_stale), busy=True, message=message)
+
+    def _set_pagination_status(self, text: str, *, busy: bool = False,
+                               stale: bool = False, error: bool = False) -> None:
+        self._pagination_status_label.setText("ПЗ: " + text)
+        self._pagination_progress.setVisible(busy)
+        if error:
+            color = "#b42318"
+        elif stale:
+            color = "#b54708"
+        elif busy:
+            color = "#175cd3"
+        else:
+            color = "#067647"
+        self._pagination_status_label.setStyleSheet(f"color:{color}; font-weight:600;")
+
+    def _pagination_status_for_current(self) -> None:
+        if self._current_sheet.get("section") != "Пояснительная записка":
+            return
+        paths = self._current_pz_paths()
+        if not paths:
+            self._set_pagination_status("нет документов")
+            return
+        busy_paths = [p for p in paths if p in self._pagination_busy]
+        if busy_paths:
+            self._set_pagination_status(
+                f"пересчитывается ({len(busy_paths)}/{len(paths)})…", busy=True)
+            return
+        errors = [self._pagination_errors[p] for p in paths if p in self._pagination_errors]
+        if errors:
+            self._set_pagination_status("ошибка: " + errors[0], error=True)
+            return
+        missing = [p for p in paths if p in self._pagination_stale
+                   or p not in self._pagination_layouts
+                   or self._pagination_layouts[p].get("page_count") is None]
+        if missing:
+            count = len(missing)
+            self._set_pagination_status(
+                f"требует пересчёта ({count} документ.)", stale=True)
+            return
+        total = sum(int(self._pagination_layouts[p].get("page_count", 0) or 0)
+                    for p in paths)
+        self._set_pagination_status(f"актуальна — {total} листов")
+
+    @Slot(object)
+    def _word_repagination_finished(self, result: dict) -> None:
+        job_id = result.get("job_id")
+        thread = self._pagination_thread_by_job.pop(job_id, None)
+        if thread is None:
+            return
+        if job_id != self._pagination_job_id:
+            for path in self._pagination_paths_by_job.pop(job_id, []):
+                self._pagination_busy.discard(path)
+            self._pagination_threads.pop(id(thread), None)
+            self.preview.set_pagination_state(
+                stale=bool(self._pagination_stale), busy=bool(self._pagination_busy))
+            self._refresh_preview()
+            return
+        for path in self._pagination_paths_by_job.pop(job_id, []):
+            self._pagination_busy.discard(path)
+        from ..models import DocKind
+        errors = result.get("errors", {})
+        for path, layout in result.get("results", {}).items():
+            invalidated_at = self._pagination_invalidated_at.get(path)
+            current_mtime = os.stat(path).st_mtime_ns if os.path.exists(path) else 0
+            accepted = invalidated_at is None or current_mtime == invalidated_at
+            if accepted:
+                self._pagination_stale.discard(path)
+                self._pagination_invalidated_at.pop(path, None)
+                self._pagination_layouts[path] = layout
+            self._pagination_errors.pop(path, None)
+            if accepted:
+                from ..core.word_pagination import store_docx_pages
+                store_docx_pages(path, self._first_form_for_path(path), layout)
+            if accepted:
+                for doc in self.project.documents:
+                    if doc.doc_kind == DocKind.POYASNITELNAYA and os.path.abspath(doc.path) == os.path.abspath(path):
+                        doc.pages = max(1, int(layout.get("page_count", 1)))
+        for path, error in errors.items():
+            if path:
+                self._pagination_errors[path] = error
+                self._set_pagination_status(
+                    f"ошибка {os.path.basename(path)}: {error}", error=True)
+                self.statusBar().showMessage(
+                    f"Не удалось пересчитать страницы {os.path.basename(path)}: {error}", 10000)
+        self._pagination_threads.pop(id(thread), None)
+        if errors and not any(path in self._pagination_errors for path in self._current_pz_paths()):
+            detail = next(iter(errors.values()))
+            self._set_pagination_status(f"ошибка: {detail}", error=True)
+        else:
+            self._pagination_status_for_current()
+        paths = self._current_pz_paths() if self._current_sheet.get("section") == "Пояснительная записка" else []
+        self.preview.set_pagination_state(
+            stale=any(path in self._pagination_stale for path in paths),
+            busy=any(path in self._pagination_busy for path in paths),
+            error=self._pagination_errors.get(self._current_sheet.get("path", ""), ""))
+        self.sheet_tree.set_project(self.project)
+        self._refresh_preview()
+        self._pagination_status_for_current()
+        if any(path in self._pagination_stale for path in self._current_pz_paths()) and not self._pagination_busy:
+            QTimer.singleShot(0, lambda: self._start_word_repagination(force=False))
+        if not errors:
+            self.statusBar().showMessage("Пересчёт страниц ПЗ завершён", 4000)
+
     def _on_sheet_selected(self, info: dict) -> None:
         self._current_sheet = info
+        # Правки текущего листа дописываем в файл до перерисовки.
+        self.preview.flush_autosave()
         self._refresh_preview()
+        if info.get("section") == "Пояснительная записка":
+            paths = self._current_pz_paths()
+            missing = [path for path in paths
+                       if path not in self._pagination_layouts
+                       or path in self._pagination_stale]
+            if missing:
+                self.statusBar().showMessage(
+                    f"ПЗ: в фоне проверяю раскладку ({len(missing)} документ.)")
+                self._set_pagination_status(
+                    f"требует пересчёта ({len(missing)} документ.)", stale=True)
+                self._start_word_repagination(force=False)
+            else:
+                self.statusBar().showMessage("ПЗ: раскладка страниц актуальна", 4000)
+                self._pagination_status_for_current()
         # Показываем настройки, относящиеся к выбранному пункту.
         self.context.show_context(info)
 
     def _on_item_modified(self) -> None:
-        """Параметр документа/приложения (needed) изменён — обновляем предпросмотр и дерево."""
+        """Состав тома изменён — обновляем предпросмотр и дерево.
+
+        Документ или приложение могли быть не только исключены, но и убраны из
+        проекта: тогда выбор в дереве указывает на несуществующий элемент, и
+        предпросмотр показывал бы заглушку удалённого файла. В этом случае
+        переключаемся на раздел, к которому элемент относился.
+        """
+        if not self._current_object_alive():
+            info = self._section_info_for_current()
+            if info:
+                self._current_sheet = info
+                self.context.show_context(info)
         self._refresh_preview()
         self.sheet_tree.set_project(self.project)
 
+    def _current_object_alive(self) -> bool:
+        """Выбранный в дереве объект всё ещё есть в проекте?"""
+        obj = self._current_sheet.get("obj")
+        if obj is None:
+            return True
+        return obj in self.project.documents or obj in self.project.appendices
+
+    def _on_structure_changed(self) -> None:
+        """Состав изменён из дерева — обновляем только листы.
+
+        Дерево уже отражает новое состояние (флажок нажат самим пользователем,
+        удаление перестроило дерево), поэтому перестраивать его не нужно —
+        иначе сбрасывался бы выбор.
+        """
+        if not self._current_object_alive():
+            info = self._section_info_for_current()
+            if info:
+                self._current_sheet = info
+                self.context.show_context(info)
+        self._refresh_preview()
+
     # ---- Редактирование полей ----
+    def _on_panel_field_changed(self, key: str, value: str) -> None:
+        """Правка поля в нижней панели штампа сохранена (по потере фокуса).
+
+        Значение пишется в модель теми же обработчиками, что и правка на самом
+        листе. После записи листы перерисовываются: правка уже завершена (фокус
+        ушёл), поэтому курсор не пострадает, а все связанные штампы — на
+        остальных листах пункта, в содержании и в самой панели — показывают
+        новое значение.
+        """
+        self._on_field_changed(key, value)
+        self._refresh_preview()
+
     def _on_field_changed(self, key: str, value: str) -> None:
         """Поле отредактировано inline. Обновляем модель и формы (без перезагрузки
         текущего листа, чтобы не прерывать ввод). Другие листы перерисуются,
@@ -356,16 +766,25 @@ class MainWindow(QMainWindow):
         if key in req_map:
             attr = req_map[key]
             if attr == "stage":
-                from ..models import Stage
-                try:
-                    req.stage = Stage(value)
-                except Exception:
-                    pass
+                # Поле на обложке/титуле показывает полное наименование стадии;
+                # принимаем и его, и обозначение «П» / «Р».
+                from ..models import parse_stage
+                stage = parse_stage(value)
+                if stage is not None:
+                    req.stage = stage
+                # Нераспознанный текст в модель не пишем; лист перерисуется
+                # из свежего снимка.
+                self.context.requisites.sync_requisites(req)
+                return
             elif attr == "year":
                 try:
                     req.year = int(value)
                 except Exception:
                     pass
+            elif attr == "volume_id":
+                # В графе «Обозначение» показано том + код раздела
+                # («02-2026-ТР.ПЗ»); в модель пишем только обозначение тома.
+                req.volume_id = self._strip_section_code(value)
             else:
                 setattr(req, attr, value)
             # Синхронизируем форму реквизитов (чтобы не было расхождений).
@@ -374,15 +793,110 @@ class MainWindow(QMainWindow):
             self.context.requisites.sync_requisites(req)
             return
 
-        # Прочие ключи (ch_* — ячейки таблицы изменений) пока не сохраняем.
+        # Таблица изменений штампа и даты подписей: ключи `ch|<раздел>|<строка>|
+        # <колонка>` и `sd|<раздел>|<роль>`. Правка сразу уходит в модель, поэтому
+        # значение обновляется во всех листах раздела.
+        if self._apply_stamp_edit(key, value):
+            return
+
+    def _apply_stamp_edit(self, key: str, value: str) -> bool:
+        """Записывает правку ячейки штампа в модель. True — ключ распознан.
+
+        Ключи: `ch|<раздел>|<строка>|<колонка>` (таблица изменений, графы 14–19),
+        `sd|<раздел>|<роль>` (дата подписи — старый формат) и
+        `sp|/ss|<раздел>|<строка>|<поле>` (строки подписей левого блока:
+        должность, фамилия, дата).
+        """
+        from ..models import (set_stamp_row_value, set_stamp_sign_date,
+                              set_stamp_signature, STAMP_CHANGE_COLS,
+                              STAMP_SIG_FIELDS)
+        parts = (key or "").split("|")
+        prefix = parts[0] if parts else ""
+        if prefix == "ch" and len(parts) == 4:
+            _, kind, row_text, col = parts
+            try:
+                row = int(row_text)
+            except ValueError:
+                return False
+            if not kind or col not in STAMP_CHANGE_COLS:
+                return False
+            set_stamp_row_value(self.project, kind, row, col, value)
+            return True
+        if prefix == "sd" and len(parts) == 3:
+            _, kind, role = parts
+            if not kind or not role:
+                return False
+            set_stamp_sign_date(self.project, kind, role, value)
+            return True
+        # Строки подписей: должность, фамилия и дата. Значение пишется в
+        # проект, поэтому оно сохраняется вместе с томом и попадает в
+        # Word/PDF при сборке. Форма нужна, чтобы перевести номер строки в
+        # общий слот данных (у графики строки 5 и 6 — это 4 и 5 записки).
+        if prefix in ("sp", "ss") and len(parts) == 4:
+            _, kind, row_text, field = parts
+            if not kind or field not in STAMP_SIG_FIELDS:
+                return False
+            try:
+                row = int(row_text)
+            except ValueError:
+                return False
+            if row < 0:
+                return False
+            form = self._stamp_row_form(kind)
+            set_stamp_signature(self.project, kind, row, field, value, form=form)
+            return True
+        return False
+
+    @staticmethod
+    def _stamp_row_form(kind: str) -> int:
+        """Форма штампа раздела: 3 — графическая часть, иначе 5 (текст).
+
+        Нужна для связи строк подписей: у формы 3 шесть строк, и её строки
+        5 и 6 несут те же данные, что строки 4 и 5 формы 5.
+        """
+        from ..models import SECTION_GRAPHIC
+        return 3 if kind == SECTION_GRAPHIC else 5
+
+    def _strip_section_code(self, value: str) -> str:
+        """Убирает доп. обозначение раздела из значения графы «Обозначение».
+
+        В графе показано «обозначение тома + код раздела»; правая инлайн-правка
+        этой ячейки не должна записывать код в обозначение тома.
+        """
+        text = (value or "").strip()
+        codes = [c for c in (self.project.section_codes or {}).values() if c]
+        for code in sorted(codes, key=len, reverse=True):
+            if text.endswith(code):
+                return text[: -len(code)].strip()
+        return text
 
     def _on_signature_clicked(self, key: str) -> None:
-        """Клик по полю подписи — выбор подписанта."""
+        """Клик по полю подписи — выбор подписанта.
+
+        Для графы «Подп.» строки штампа (`ss|<раздел>|<строка>|signature`)
+        выбор записывается в эту строку: фамилия подставляется из реестра, а
+        изображение подписи подтягивается по фамилии.
+        """
         from ..core.preview_model import role_label, build_preview_snapshot
+        from ..models import set_stamp_signature
         # Сначала синхронизируем формы с моделью (чтобы реестр подписантов был актуален)
         self.context.signers_form.set_signers(self.project.signers)
         self._collect_forms()
         snapshot = build_preview_snapshot(self.project)
+        row_ref = self._stamp_row_ref(key)
+        if row_ref is not None:
+            kind, row = row_ref
+            label_text = self._stamp_row_title(kind, row)
+            current_surname = self._stamp_row_surname(kind, row)
+            dlg = SignaturePickerDialog(self, role_label=label_text,
+                                        signers=snapshot["signers"],
+                                        current_surname=current_surname)
+            if dlg.exec() == SignaturePickerDialog.Accepted:
+                set_stamp_signature(self.project, kind, row, "surname",
+                                    dlg.result_surname or "",
+                                    form=self._stamp_row_form(kind))
+                self._refresh_preview()
+            return
         role_label_text = role_label(key)
         current = signer_for_role(self.project, key)
         current_surname = current.surname if current else ""
@@ -395,6 +909,41 @@ class MainWindow(QMainWindow):
             else:
                 self.project.signature_assignments.pop(key, None)
             self._refresh_preview()
+
+    @staticmethod
+    def _stamp_row_ref(key: str):
+        """(раздел, номер строки) для ключа строки подписи штампа, иначе None."""
+        parts = (key or "").split("|")
+        if len(parts) != 4 or parts[0] != "ss" or parts[3] != "signature":
+            return None
+        try:
+            row = int(parts[2])
+        except ValueError:
+            return None
+        if not parts[1] or row < 0:
+            return None
+        return parts[1], row
+
+    def _stamp_row(self, kind: str, row: int) -> dict:
+        """Строка подписи раздела по номеру (значения по умолчанию + правки)."""
+        from ..models import stamp_signature_rows, SECTION_GRAPHIC
+        form = 3 if kind == SECTION_GRAPHIC else 5
+        rows = stamp_signature_rows(self.project, kind, form)
+        if 0 <= row < len(rows):
+            return rows[row]
+        return {}
+
+    def _stamp_row_title(self, kind: str, row: int) -> str:
+        """Подпись строки для окна выбора подписанта (должность + фамилия)."""
+        data = self._stamp_row(kind, row)
+        post = (data.get("post") or "").strip()
+        surname = (data.get("surname") or "").strip()
+        if post and surname:
+            return f"{post} — {surname}"
+        return post or surname or "Подпись"
+
+    def _stamp_row_surname(self, kind: str, row: int) -> str:
+        return (self._stamp_row(kind, row).get("surname") or "").strip()
 
     # ---- Файловые операции ----
     def _new(self) -> None:
@@ -445,10 +994,19 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить:\n{e}")
 
     def _build(self) -> None:
-        """Собрать весь том: и Word (DOCX), и PDF."""
+        """Собрать том: форматы выбираются в мини-окне «Собрать том»."""
         from PySide6.QtWidgets import QFileDialog, QMessageBox
+
         if not self._confirm_pending_pz_edits("собирать том"):
             return
+
+        # Форматы спрашиваем окном: «Отмена» в нём отменяет всю сборку,
+        # поэтому проверки и preflight идут уже после выбора форматов.
+        answer = self._ask_build_formats()
+        if not answer:
+            return
+        formats, chapters = answer
+
         self._collect_forms()
 
         # Preflight: ошибки блокируют сборку, warnings — с подтверждением.
@@ -473,9 +1031,26 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.Yes:
                 return
 
-        # Запрашиваем базовое имя файла; DOCX и PDF создаются рядом.
-        base = QFileDialog.getSaveFileName(self, "Сохранить том", "том.docx",
-                                           "Документ Word (*.docx)")[0]
+        # Имя по умолчанию: обозначение тома и дата сборки.
+        from datetime import date
+        from ..core.docx_exporter import _safe_filename
+        volume_id = (self.project.requisites.volume_id or "том").strip()
+        today = date.today()
+        default_name = _safe_filename(
+            f"{volume_id}_{today.year % 100:02d}_{today.month:02d}_{today.day:02d}")
+        filters = {"pdf": "PDF (*.pdf)", "docx": "Документ Word (*.docx)",
+                   "html": "HTML (*.html)"}
+        ext = {"pdf": ".pdf", "docx": ".docx", "html": ".html"}[formats[0]]
+        if chapters:
+            out_dir = QFileDialog.getExistingDirectory(
+                self, "Каталог для файлов по разделам")
+            if not out_dir:
+                return
+            base = os.path.join(out_dir, default_name + ext)
+        else:
+            filter_str = ";;".join(filters[f] for f in formats)
+            base = QFileDialog.getSaveFileName(
+                self, "Сохранить том", default_name + ext, filter_str)[0]
         if not base:
             return
 
@@ -489,147 +1064,96 @@ class MainWindow(QMainWindow):
             filename=log_path, filemode="a", level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s: %(message)s")
         log = logging.getLogger("tom_builder.build")
-        log.info("=== Сборка тома: %s ===", base)
+        log.info("=== Сборка тома: %s (форматы: %s) ===", base, ", ".join(formats))
 
-        try:
-            from ..config import load_config
-            cfg = load_config()
+        stem = os.path.splitext(base)[0]
+        from PySide6.QtCore import QEventLoop
+        from .build_worker import BuildWorker
+        from .build_progress import BuildProgressDialog
 
-            docx_out = base if base.lower().endswith(".docx") else base + ".docx"
-            pdf_out = os.path.splitext(docx_out)[0] + ".pdf"
+        progress = BuildProgressDialog(self)
+        progress.show()
 
-            from ..core.docx_exporter import build_text_docx
-            build_text_docx(self.project, docx_out, cfg)
-            log.info("DOCX: %s", docx_out)
+        thread = QThread(self)
+        worker = BuildWorker(self.project, formats, chapters, base)
+        worker.moveToThread(thread)
+        loop = QEventLoop(self)
+        result = {}
+        worker.progress.connect(progress.set_stage)
+        worker.finished.connect(lambda data: (result.update(data), loop.quit()))
+        thread.started.connect(worker.run)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        loop.exec()
+        thread.quit()
+        thread.wait()
 
-            full_pdf = None
-            pdf_error = None
+        done = result.get("done", [])
+        failed = result.get("failed", [])
+        html_path = result.get("html_path")
+
+        if "pdf" in formats:
+            out = stem + ".pdf"
             try:
-                from ..core.pdf_builder import build_full_pdf
-                full_pdf = build_full_pdf(self.project, pdf_out, cfg)
-                log.info("PDF: %s", full_pdf)
-            except Exception as pe:
-                # Причина не теряется: лог + текст пользователю.
-                log.exception("build_full_pdf failed")
-                pdf_error = str(pe) or type(pe).__name__
+                from ..core.html_export import html_file_to_pdf
+                if html_path and os.path.exists(html_path):
+                    progress.set_stage("Подготовка PDF…")
+                    progress.show()
 
-            msg = f"Том собран в Word (DOCX):\n{docx_out}"
-            if full_pdf:
-                msg += f"\n\nТом собран в PDF:\n{full_pdf}"
-            else:
-                msg += (f"\n\nНе удалось собрать PDF:\n{pdf_error}"
-                        f"\n\nПодробности: {log_path}")
-                QMessageBox.warning(self, "PDF не собран", msg)
-                return
+                    def update_pdf_progress(current, total):
+                        progress.set_sheet_progress(current, total)
+                        from PySide6.QtWidgets import QApplication
+                        QApplication.processEvents()
+
+                    html_file_to_pdf(html_path, out,
+                                     progress_callback=update_pdf_progress)
+                    progress.finish()
+                    log.info("PDF (из HTML): %s", out)
+                    done.append(f"PDF: {out}")
+                else:
+                    raise RuntimeError(
+                        "HTML-том не собран — печатать PDF не из чего")
+            except Exception as e:
+                log.exception("html_file_to_pdf failed")
+                failed.append(f"PDF: {e}")
+        progress.close()
+
+        # Итог: что собрано и что не удалось (частичный успех не скрывается).
+        msg = ""
+        if done:
+            msg = "Том собран:\n\n" + "\n".join(done)
+        if failed:
+            msg += ("\n\n" if msg else "") + "Не удалось собрать:\n\n" \
+                + "\n".join(failed) + f"\n\nПодробности: {log_path}"
+            QMessageBox.warning(self, "Сборка завершена с ошибками", msg)
+        else:
             QMessageBox.information(self, "Готово", msg)
-        except Exception as e:
-            log.exception("build failed")
-            QMessageBox.critical(
-                self, "Ошибка",
-                f"Не удалось собрать том:\n{e}\n\nПодробности: {log_path}")
 
-    def _on_build_section(self, info: dict) -> None:
-        """Собрать выбранный раздел тома целиком (Word / PDF)."""
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
-        if not self._confirm_pending_pz_edits("собирать раздел"):
-            return
-        self._collect_forms()
-        section = info.get("section", "")
-        label = info.get("label", section)
-        # Диалог выбора формата и файла.
-        out, selected_filter = QFileDialog.getSaveFileName(
-            self, f"Собрать раздел «{label}»", f"{section}.docx",
-            "Документ Word (*.docx);;PDF (*.pdf)")
-        if not out:
-            return
+    def _log_build_error(self, message: str) -> str:
+        """Пишет traceback в tmp/build.log и возвращает путь к логу."""
+        import logging
+        log_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "tmp", "build.log")
         try:
-            from ..config import load_config
-            cfg = load_config()
-            if out.lower().endswith(".pdf"):
-                from ..core.pdf_builder import build_section_pdf
-                build_section_pdf(self.project, section, out, cfg)
-                QMessageBox.information(self, "Готово",
-                                        f"Раздел «{label}» собран в PDF:\n{out}")
-            else:
-                from ..core.docx_exporter import build_section_docx
-                build_section_docx(self.project, section, out, cfg)
-                QMessageBox.information(self, "Готово",
-                                        f"Раздел «{label}» собран в Word:\n{out}")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось собрать раздел:\n{e}")
-
-    def _on_build_section_current(self) -> None:
-        """«Собрать раздел» (пункт меню): собрать раздел текущего листа."""
-        info = self._section_info_for_current()
-        if not info:
-            return
-        self._on_build_section(info)
-
-    def _build_html_volume(self) -> None:
-        """«Собрать» в HTML: собрать весь том в один HTML-файл."""
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
-        if not self._confirm_pending_pz_edits("собирать том"):
-            return
-        self._collect_forms()
-        out = QFileDialog.getSaveFileName(self, "Собрать том в HTML", "том.html",
-                                          "HTML (*.html)")[0]
-        if not out:
-            return
-        try:
-            from ..core.preview_html import build_volume_html
-            build_volume_html(self.project, out)
-            QMessageBox.information(self, "Готово", f"Том собран в HTML:\n{out}")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось собрать том в HTML:\n{e}")
-
-    def _build_html_pdf_volume(self) -> None:
-        """Экспорт всего тома по цепочке данные → HTML → PDF."""
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
-        if not self._confirm_pending_pz_edits("экспортировать том"):
-            return
-        self._collect_forms()
-        out = QFileDialog.getSaveFileName(
-            self, "Экспорт HTML → PDF", "том.pdf", "PDF (*.pdf)")[0]
-        if not out:
-            return
-        if not out.lower().endswith(".pdf"):
-            out += ".pdf"
-        try:
-            from ..core.html_export import build_volume_html_pdf
-            build_volume_html_pdf(self.project, out)
-            QMessageBox.information(
-                self, "Готово",
-                f"Том экспортирован по цепочке HTML → PDF:\n{out}\n\n"
-                f"Промежуточный HTML сохранён рядом с PDF.")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка HTML → PDF", f"Не удалось экспортировать том:\n{e}")
-
-    def _build_html_section(self) -> None:
-        """«Собрать раздел» в HTML: собрать текущий раздел в один HTML-файл."""
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
-        if not self._confirm_pending_pz_edits("собирать раздел"):
-            return
-        self._collect_forms()
-        info = self._section_info_for_current()
-        if not info:
-            return
-        section = info.get("section", "")
-        label = info.get("label", section)
-        out = QFileDialog.getSaveFileName(self, f"Собрать раздел «{label}» в HTML",
-                                          f"{section}.html", "HTML (*.html)")[0]
-        if not out:
-            return
-        try:
-            from ..core.preview_html import build_section_html
-            build_section_html(self.project, section, out)
-            QMessageBox.information(self, "Готово",
-                                    f"Раздел «{label}» собран в HTML:\n{out}")
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось собрать раздел в HTML:\n{e}")
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            logging.basicConfig(filename=log_path, filemode="a", level=logging.INFO,
+                                format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+            logging.getLogger("tom_builder.build").exception(message)
+        except Exception:
+            pass
+        return log_path
 
     # ---- Правка текста и таблиц ПЗ прямо в предпросмотре ----
-    def _save_pz_edits(self) -> None:
-        """Записывает в DOCX правки абзацев и ячеек таблиц из предпросмотра."""
+    def _save_pz_edits(self, silent: bool = False) -> None:
+        """Записывает в DOCX правки абзацев и ячеек таблиц из предпросмотра.
+
+        :param silent: автосохранение — без диалогов и без перерисовки листов
+            (перерисовка сбросила бы курсор посреди ввода). Дерево и
+            предпросмотр обновляются при следующем переключении.
+        """
         pending = self.preview.pz_pending_edits()
         pending_cells = self.preview.pz_pending_cell_edits()
         if not pending and not pending_cells:
@@ -647,73 +1171,133 @@ class MainWindow(QMainWindow):
                     f"{os.path.basename(path)}: абзацев — {result['paragraphs']}, "
                     f"ячеек таблиц — {result['table_cells']}")
             if total == 0:
-                QMessageBox.information(
-                    self, "Нет изменений",
-                    "Текст пояснительной записки не изменился.")
+                if not silent:
+                    QMessageBox.information(
+                        self, "Нет изменений",
+                        "Текст пояснительной записки не изменился.")
                 self.preview.clear_pz_edits()
                 return
             # Правки записаны — учитываем их как применённые.
             for path in dict.fromkeys(list(pending) + list(pending_cells)):
                 self.preview.clear_pz_edits(path)
+            changed_paths = set(pending) | set(pending_cells)
+            self._pagination_stale.update(changed_paths)
+            for path in changed_paths:
+                self._pagination_invalidated_at[path] = os.stat(path).st_mtime_ns if os.path.exists(path) else 0
+                self._pagination_layouts.pop(path, None)
+            from ..core.word_pagination import invalidate_docx_pages
+            for path in changed_paths:
+                invalidate_docx_pages(path)
+            if silent:
+                # Лист уже показывает введённый текст — перерисовка не нужна.
+                self._pages_dirty.update(changed_paths)
+                self._autosave_notice()
+                return
+            # Число листов и план Word будут обновлены при следующем переходе
+            # в раздел ПЗ либо вручную по кнопке.
             self._refresh_preview()
-            # Обновляем число листов документов ПЗ (могло измениться).
-            from ..models import DocKind
-            for d in self.project.documents:
-                if d.doc_kind == DocKind.POYASNITELNAYA:
-                    self._refresh_doc_pages(d, self.project)
             self.sheet_tree.set_project(self.project)
+            self._autosave_notice()
             QMessageBox.information(
                 self, "Сохранено",
                 "Правки пояснительной записки и её таблиц записаны "
                 "в исходный DOCX:\n"
                 + "\n".join(details))
         except Exception as e:
+            # Молча терять правки нельзя: причина — в лог, пользователю — сообщение.
+            log_path = self._log_build_error(f"не удалось записать правки ПЗ: {e}")
             QMessageBox.critical(
                 self, "Ошибка сохранения",
-                f"Не удалось записать правки пояснительной записки:\n{e}")
+                f"Не удалось записать правки пояснительной записки:\n{e}\n\n"
+                f"Подробности: {log_path}")
 
-    # ---- Редактор пояснительной записки ----
-    def _pz_document(self):
-        """Возвращает DOCX пояснительной записки для текущего выбора в дереве.
+    def _on_pz_autosave(self) -> None:
+        """Автосохранение: правки уходят в связанный DOCX без диалогов.
 
-        Если выбран документ раздела «Пояснительная записка», берётся он;
-        иначе — первый доступный DOCX этого раздела.
+        Формы сюда не собираются: правки ПЗ живут в предпросмотре и в модели
+        реквизитов не участвуют — лишняя синхронизация только мешала бы вводу.
         """
+        self._save_pz_edits(silent=True)
+
+    def _autosave_notice(self) -> None:
+        """Показывает, что правки уже записаны в файл (кратковременная подсказка)."""
+        sb = self.statusBar()
+        sb.showMessage("Правки пояснительной записки сохранены в файл", 4000)
+
+    def _refresh_dirty_pages(self) -> None:
+        """Пересчитывает число листов у документов, которые правили.
+
+        Вызывается, когда число листов действительно нужно (перерисовка листа,
+        сборка): при обычном вводе пересчёт не выполняется, чтобы не тормозить.
+        """
+        if not self._pages_dirty:
+            return
         from ..models import DocKind
-        sheet = self._current_sheet
-        obj = sheet.get("obj")
-        if obj is not None and getattr(obj, "doc_kind", None) == DocKind.POYASNITELNAYA:
-            path = getattr(obj, "path", "") or ""
-            if path.lower().endswith((".docx", ".doc")) and os.path.exists(path):
-                return obj
-        # Иначе — любой DOCX раздела ПЗ (в т.ч. исключённый из сборки).
         for d in self.project.documents:
-            if getattr(d, "doc_kind", None) != DocKind.POYASNITELNAYA:
+            if d.doc_kind != DocKind.POYASNITELNAYA:
                 continue
             path = getattr(d, "path", "") or ""
-            if path.lower().endswith((".docx", ".doc")) and os.path.exists(path):
-                return d
-        return None
+            if path in self._pages_dirty:
+                self._refresh_doc_pages(d, self.project)
+        self._pages_dirty.clear()
 
-    def _edit_current_pz(self) -> None:
-        """Открывает редактор всех листов пояснительной записки."""
-        self._collect_forms()
-        doc = self._pz_document()
+    # ---- Настройки оформления ----
+    def _open_text_fonts(self) -> None:
+        """Настройки шрифтов текста ПЗ: обычный текст, заголовки, таблицы.
+
+        Значения сохраняются в конфигурацию оформления (config.json) и сразу
+        применяются к предпросмотру: кегль в предпросмотре и в собранном томе
+        должен совпадать, иначе число листов расходится.
+        """
+        from ..config import load_config, save_config
+        from .fonts_dialog import TextFontsDialog
+        cfg = load_config()
+        dlg = TextFontsDialog(self, cfg)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        dlg.apply_to(cfg)
+        try:
+            save_config(cfg)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Настройки не сохранены",
+                f"Не удалось записать config.json:\n{e}\n\n"
+                "Значения применены до перезапуска программы.")
+        # Кегли влияют на Word-компоновку: помечаем планы устаревшими.
+        for path in self._current_pz_paths():
+            self._pagination_stale.add(path)
+            self._pagination_invalidated_at[path] = os.stat(path).st_mtime_ns
+            self._pagination_layouts.pop(path, None)
+        from ..core.word_pagination import invalidate_docx_pages
+        invalidate_docx_pages()
+        self._refresh_preview()
+        if self._current_sheet.get("section") == "Пояснительная записка":
+            self._start_word_repagination()
+
+    def _open_pz_editor(self, doc) -> None:
+        """Постраничный редактор записки — единственный вход для всех кнопок."""
         if doc is None:
+            return
+        path = getattr(doc, "path", "") or ""
+        if not self._is_editable_docx(path):
             QMessageBox.information(
-                self, "Нет пояснительной записки",
-                "В разделе «Пояснительная записка» нет исходного документа Word (DOCX).\n"
-                "Добавьте документ в разделе или выберите DOCX в дереве «Листы тома».")
+                self, "Формат не поддерживается",
+                "Редактирование доступно только для исходного документа Word (DOCX).")
             return
         from .pz_editor import PzEditorDialog
         from ..core.preview_html import pz_doc_first_form
-        dlg = PzEditorDialog(doc.path, self,
-                             first_form=pz_doc_first_form(self.project, doc.path))
+        dlg = PzEditorDialog(path, self,
+                             first_form=pz_doc_first_form(self.project, path))
         if dlg.exec() == QDialog.Accepted:
-            # Текст изменился — пересчитываем листы и обновляем предпросмотр и дерево.
-            self._refresh_doc_pages(doc, self.project)
+            # Текст изменился — план Word нужно обновить.
+            self._mark_pagination_stale(path)
             self._refresh_preview()
             self.sheet_tree.set_project(self.project)
+
+    @staticmethod
+    def _is_editable_docx(path: str) -> bool:
+        return bool(path) and path.lower().endswith((".docx", ".doc")) \
+            and os.path.exists(path)
 
     @staticmethod
     def _refresh_doc_pages(doc, project=None) -> None:

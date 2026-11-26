@@ -16,6 +16,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import pymupdf
 
 from .gost import Frame, FORM_HEIGHT, STAMP_WIDTH_MM, \
@@ -139,8 +141,12 @@ SHEET_COL_W = 10.0        # правая узкая колонка «Лист / 
 
 
 def _header_value_h(form) -> tuple:
-    """Высоты строки заголовка и строки значений таблицы изменений (мм)."""
-    return 7.5, 7.5
+    """Высоты строки заголовка и строки значений таблицы изменений (мм).
+
+    Заголовок таблицы изменений стоит над первой строкой подписей: у формы 5
+    это y 10..15, у формы 3 — y 20..25 (см. FORM5_HLINES/FORM3_HLINES).
+    """
+    return (10.0, 5.0) if form != FORM_GRAPHIC else (20.0, 5.0)
 
 
 # ---- Сетка правого блока штампа (мм от левого-верхнего угла) ----------------
@@ -156,6 +162,44 @@ DESIGN_X1 = 135.0
 STAGE_COLS = ((135.0, 15.0), (150.0, 15.0), (165.0, 20.0))   # (x, ширина) x3
 
 
+def _layout_form6(stamp_h: float) -> list:
+    """Раскладка формы 6 (185 x 15) по сетке app.core.geometry.
+
+    Левый блок (0..65) — таблица изменений из ШЕСТИ граф 10/10/10/10/15/10
+    (``geometry.CHANGE_COLS``): два ряда значений (0..5 и 5..10) и подписи в
+    нижней полосе 10..15. Раньше у PDF-рендера была своя разбивка на пять граф
+    (10/10/15/15/15), и сетка расходилась с Word и HTML-предпросмотром.
+
+    «Лист» (175..185): заголовок 0..7, значение 7..15 — как на образце
+    «Форма 6.pdf»; линия на 7 мм проходит только в этой графе.
+    """
+    from .geometry import CHANGE_COLS as F6_COLS, CHANGE_LABELS as F6_LABELS
+
+    cells = []
+    # Два ряда значений таблицы изменений.
+    x = 0.0
+    for width in F6_COLS:
+        for y in (0.0, 5.0):
+            cells.append({"x": x, "y": y, "w": width, "h": 5.0,
+                          "text": "", "key": "", "role": "value"})
+        x += width
+    # Подписи — нижняя полоса.
+    x = 0.0
+    for width, label in zip(F6_COLS, F6_LABELS):
+        cells.append({"x": x, "y": 10.0, "w": width, "h": 5.0,
+                      "text": label, "key": "", "role": "header"})
+        x += width
+    # Обозначение документа.
+    cells.append({"x": DESIGN_X0, "y": 0.0, "w": 175.0 - DESIGN_X0, "h": stamp_h,
+                  "text": "", "key": "volume", "role": "design"})
+    # Колонка «Лист».
+    cells.append({"x": 175.0, "y": 0.0, "w": 10.0, "h": 7.0,
+                  "text": "Лист", "key": "", "role": "header"})
+    cells.append({"x": 175.0, "y": 7.0, "w": 10.0, "h": stamp_h - 7.0,
+                  "text": "", "key": "sheet", "role": "sheet"})
+    return cells
+
+
 def _layout(form) -> list:
     """Раскладка основной надписи (ячейки в мм от левого-верхнего угла штампа).
 
@@ -169,31 +213,45 @@ def _layout(form) -> list:
     Сетка согласована с эталонными образцами и HTML-предпросмотром.
     """
     stamp_h = FORM_HEIGHT.get(form, 40.0)
-    header_h, value_h = _header_value_h(form)
+    if form == FORM_TEXT_NEXT:
+        return _layout_form6(stamp_h)
+    # header_y — верх строки заголовка таблицы изменений (мм от верха штампа).
+    header_y, header_h = _header_value_h(form)
     change_w = sum(CHANGE_COLS)
 
     cells = []
 
-    # --- Таблица изменений: заголовок + значения ---
+    # --- Таблица изменений: только заголовок. Строка значений совпадает с
+    # первой строкой подписей («Разраб.») — так на образцах форм 5 и 3.
+    # У формы 6 своя раскладка — см. _layout_form6.
+    hdr_y = header_y
+    hdr_h = 5.0
     x = 0.0
-    for wd, lb, key in zip(CHANGE_COLS, CHANGE_LABELS, CHANGE_KEYS):
-        cells.append({"x": x, "y": 0.0, "w": wd, "h": header_h,
+    for wd, lb in zip(CHANGE_COLS, CHANGE_LABELS):
+        cells.append({"x": x, "y": hdr_y, "w": wd, "h": hdr_h,
                       "text": lb, "key": "", "role": "header"})
-        cells.append({"x": x, "y": header_h, "w": wd, "h": value_h,
-                      "text": "", "key": key, "role": "value"})
         x += wd
-
-    # --- Форма 6 (185x15): обозначение 65..175 + узкая колонка «Лист» 175..185 ---
-    if form == FORM_TEXT_NEXT:
-        cells.append({"x": DESIGN_X0, "y": 0.0, "w": 175.0 - DESIGN_X0, "h": stamp_h,
-                      "text": "", "key": "volume", "role": "design"})
-        cells.append({"x": 175.0, "y": 0.0, "w": 10.0, "h": stamp_h,
-                      "text": "", "key": "sheet", "role": "sheet"})
-        return cells
 
     # --- Обозначение (графа 1): 65..135 на всю высоту штампа ---
     cells.append({"x": DESIGN_X0, "y": 0.0, "w": DESIGN_X1 - DESIGN_X0, "h": stamp_h,
                   "text": "", "key": "volume", "role": "design"})
+
+    # --- Строки подписей левого блока (должность | фамилия | подпись | дата) ---
+    # Раскладка строк — единый источник geometry.stamp_signature_rows: те же
+    # строки и координаты, что в Word-таблице и HTML-предпросмотре.
+    # Колонки по сетке: 0..20 должность, 20..40 фамилия, 40..55 графа «Подп.»,
+    # 55..65 дата.
+    from .geometry import stamp_signature_rows
+    form_num = FORM_GRAPHIC if form == FORM_GRAPHIC else FORM_TEXT_FIRST
+    for _r0, _r1, y, _role, index in stamp_signature_rows(form_num):
+        cells.append({"x": 0.0, "y": y, "w": 20.0, "h": 5.0,
+                      "text": "", "key": f"sigpost{index}", "role": "sig_post"})
+        cells.append({"x": 20.0, "y": y, "w": 20.0, "h": 5.0,
+                      "text": "", "key": f"sigsurname{index}", "role": "sig_name"})
+        cells.append({"x": 40.0, "y": y, "w": 15.0, "h": 5.0,
+                      "text": "", "key": f"sigimage{index}", "role": "sig_sign"})
+        cells.append({"x": 55.0, "y": y, "w": 10.0, "h": 5.0,
+                      "text": "", "key": f"sigdate{index}", "role": "sig_date"})
 
     # Вертикальные границы блоков зависят от формы (см. FORM3_HLINES/FORM5_HLINES
     # в preview_html и сетки в geometry):
@@ -316,7 +374,9 @@ def draw_frame_and_stamp(page, page_w_mm: float, page_h_mm: float,
 
     texts — значения граф по ключам. Дополнительно:
       texts["cell9_logo"] — путь к PDF-файлу логотипа организации: если задан,
-      графа 9 заполняется логотипом (вписывается в ячейку без искажений).
+      графа 9 заполняется логотипом (вписывается в ячейку без искажений);
+      texts["signatures"] — строки подписей левого блока (models.stamp_signature_rows):
+      должность, фамилия, дата и путь к изображению подписи каждой строки.
     """
     font_map = font_map or FontMap()
     texts = texts or {}
@@ -346,6 +406,22 @@ def draw_frame_and_stamp(page, page_w_mm: float, page_h_mm: float,
     for c in cells:
         c["text"] = texts.get(c.get("key", ""), c.get("text", ""))
 
+    # Строки подписей: значение каждой ячейки берётся из строки по её номеру.
+    signatures = texts.get("signatures") or []
+    for c in cells:
+        role = c.get("role") or ""
+        if not role.startswith("sig_"):
+            continue
+        row = _signature_row(signatures, c.get("key", ""))
+        if role == "sig_post":
+            c["text"] = str(row.get("post") or "")
+        elif role == "sig_name":
+            c["text"] = str(row.get("surname") or "")
+        elif role == "sig_date":
+            c["text"] = str(row.get("date") or "")
+        elif role == "sig_sign":
+            c["text"] = ""
+
     for c in cells:
         if c.get("role") == "design" and c["key"] == "volume":
             c["text"] = texts.get("volume", c["text"])
@@ -353,9 +429,67 @@ def draw_frame_and_stamp(page, page_w_mm: float, page_h_mm: float,
         if c.get("key") in CELL9_KEYS and _draw_cell9_logo(page, sx, sy, c, texts):
             _draw_cell_border(page, sx, sy, c)
             continue
+        # Графа «Подп.» строки: изображение подписи подписанта по фамилии строки.
+        if c.get("role") == "sig_sign":
+            row = _signature_row(signatures, c.get("key", ""))
+            if _draw_signature_image(page, sx, sy, c, row):
+                _draw_cell_border(page, sx, sy, c)
+                continue
         _draw_cell(page, sx, sy, c, fname, font_map)
 
     return
+
+
+def _signature_row(signatures, key) -> dict:
+    """Строка подписей штампа по номеру в ключе ячейки (`sig...<номер>`)."""
+    if not signatures:
+        return {}
+    digits = "".join(ch for ch in str(key or "") if ch.isdigit())
+    if not digits:
+        return {}
+    try:
+        index = int(digits)
+    except ValueError:
+        return {}
+    for row in signatures:
+        if int((row or {}).get("row", -1)) == index:
+            return row
+    return {}
+
+
+def _draw_signature_image(page, sx_mm: float, sy_mm: float, cell: dict,
+                          row: dict) -> bool:
+    """Рисует изображение подписи в ячейке графы «Подп.» основной надписи.
+
+    В ячейку вписывается САМ РОСЧЕРК: размеры берутся по обрезанному
+    изображению (`preview_html.signature_fit_mm`). Иначе скан подписи с белыми
+    полями уменьшался целиком, и росчерк получался в несколько миллиметров.
+    Возвращает True, если картинка нарисована; False — подписи нет.
+    """
+    path = str((row or {}).get("signature_image") or "")
+    if not path or not os.path.exists(path):
+        return False
+    fit_w_mm = fit_h_mm = 0.0
+    try:
+        from .preview_html import signature_fit_mm
+        fit_w_mm, fit_h_mm = signature_fit_mm(path, cell["w"], cell["h"])
+    except Exception:
+        fit_w_mm = fit_h_mm = 0.0
+    if fit_w_mm <= 0 or fit_h_mm <= 0:
+        return False
+    x = mm_to_pt(sx_mm + cell["x"])
+    y = mm_to_pt(sy_mm + cell["y"])
+    w = mm_to_pt(cell["w"])
+    h = mm_to_pt(cell["h"])
+    fit_w, fit_h = mm_to_pt(fit_w_mm), mm_to_pt(fit_h_mm)
+    x0 = x + (w - fit_w) / 2.0
+    y0 = y + (h - fit_h) / 2.0
+    try:
+        page.insert_image(pymupdf.Rect(x0, y0, x0 + fit_w, y0 + fit_h),
+                          filename=path, keep_proportion=True)
+        return True
+    except Exception:
+        return False
 
 
 #: Минимальный кегль при автоподгонке текста в ячейку основной надписи.
