@@ -75,7 +75,8 @@ class BuildWorker(QObject):
         if "docx" in self.formats:
             self.progress.emit("Формирование документа Word…")
             try:
-                from ..core.docx_exporter import build_text_docx, build_chapters_docx
+                from ..core.docx_exporter import (build_text_docx_with_content,
+                                  build_chapters_docx)
                 cfg = load_config()
                 if self.chapters:
                     paths = build_chapters_docx(
@@ -86,7 +87,7 @@ class BuildWorker(QObject):
                                 + "\n  ".join(os.path.basename(p) for p in paths))
                 else:
                     out = stem + ".docx"
-                    actual = build_text_docx(self.project, out, cfg)
+                    actual = build_text_docx_with_content(self.project, out, cfg)
                     log.info("DOCX: %s", actual)
                     if os.path.abspath(actual) != os.path.abspath(out):
                         done.append(

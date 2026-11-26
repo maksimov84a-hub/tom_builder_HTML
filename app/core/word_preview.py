@@ -52,7 +52,7 @@ def _manifest_path(path: str) -> str:
 
 
 def _read_manifest(path: str) -> dict:
-    """Читает манифест сборки: ключ состояния и фактический путь файла."""
+    """Читает манифест сборки: ключ состояния, фактический путь и число листов."""
     try:
         with open(_manifest_path(path), "r", encoding="utf-8") as stream:
             data = json.load(stream)
@@ -61,12 +61,67 @@ def _read_manifest(path: str) -> dict:
         return {}
 
 
-def _write_manifest(path: str, key: str, actual: str) -> None:
+def _write_manifest(path: str, key: str, actual: str, pages: int | None = None) -> None:
+    """Пишет манифест сборки.
+
+    :param pages: фактическое число листов собранного раздела (None — ещё не
+        измерено). Хранится, чтобы содержание тома не пересобирало раздел
+        заново ради одной цифры.
+    """
+    data = {"key": key, "path": actual}
+    if pages is not None:
+        data["pages"] = int(pages)
     try:
         with open(_manifest_path(path), "w", encoding="utf-8") as stream:
-            json.dump({"key": key, "path": actual}, stream, ensure_ascii=False)
+            json.dump(data, stream, ensure_ascii=False)
     except OSError:
         pass
+
+
+def set_preview_pages(project=None, section_kind: str = "", pages: int = 0) -> None:
+    """Запоминает фактическое число листов собранного раздела.
+
+    Вызывается после того, как Word открыл документ: `ComputeStatistics(2)`
+    даёт настоящее число листов, а оно нужно содержанию тома (см.
+    `preview_page_count`).
+    """
+    base = preview_path(project, section_kind)
+    manifest = _read_manifest(base)
+    if not manifest:
+        return
+    _write_manifest(base, str(manifest.get("key") or ""),
+                    str(manifest.get("path") or ""), pages=int(pages or 0))
+
+
+def preview_page_count(project=None, section_kind: str = "") -> int:
+    """Число листов собранного раздела (0 — неизвестно или копия устарела).
+
+    Именно это число попадает в том: собранный раздел занимает больше листов,
+    чем исходная записка (оформленные таблицы, отступы, штампы), поэтому
+    содержание тома должно брать листы отсюда, а не считать по исходному DOCX.
+    """
+    base = preview_path(project, section_kind)
+    manifest = _read_manifest(base)
+    if not manifest:
+        return 0
+    actual = str(manifest.get("path") or "")
+    if not actual or not os.path.exists(actual):
+        return 0
+    try:
+        if str(manifest.get("key") or "") != _signature_key(
+                source_signature(project)):
+            return 0
+    except Exception:
+        return 0
+    try:
+        return max(0, int(manifest.get("pages") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def invalidate_preview_pages(project=None, section_kind: str = "") -> None:
+    """Забывает число листов: правки в Word могли изменить раскладку."""
+    set_preview_pages(project, section_kind, 0)
 
 
 def current_preview_path(project=None, section_kind: str = "") -> str:
@@ -276,7 +331,59 @@ def build_preview_docx(project, section_kind: str = "", *, force: bool = False,
     _upgrade_compatibility(target)
     _write_manifest(base, signature, target)
     _drop_other_versions(base, target)
+    # Число листов измеряем сразу: оно нужно содержанию тома, а сборка и так
+    # только что выполнялась. Если Word недоступен — останется неизвестным.
+    set_preview_pages(project, section, count_docx_pages(target))
     return target
+
+
+def count_docx_pages(path: str) -> int:
+    """Число листов DOCX по Word (0 — Word недоступен или файл не прочитан).
+
+    Поля документа пересчитываются перед измерением — так же, как при показе
+    листов во встроенном Word: номера в оглавлении (`PAGEREF`) и в штампе
+    (`PAGE`) занимают место, и без пересчёта число листов могло отличаться от
+    того, что увидит пользователь.
+    """
+    if not path or not os.path.exists(path):
+        return 0
+    try:
+        from .word_com import ensure_pywin32
+        ensure_pywin32()
+        import win32com.client
+    except Exception:
+        return 0
+    try:
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+    except Exception:
+        return 0
+    doc = None
+    pages = 0
+    try:
+        doc = word.Documents.Open(os.path.abspath(path), ReadOnly=False,
+                                  AddToRecentFiles=False, Visible=False)
+        try:
+            doc.Repaginate()
+            doc.Fields.Update()
+            doc.Repaginate()
+        except Exception:
+            pass
+        pages = max(0, int(doc.ComputeStatistics(2)))
+    except Exception:
+        pages = 0
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except Exception:
+                pass
+        try:
+            word.Quit()
+        except Exception:
+            pass
+    return pages
 
 
 def mark_stale(project, section_kind: str = "") -> None:

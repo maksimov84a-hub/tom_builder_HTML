@@ -45,6 +45,138 @@ def _mm(v: float) -> int:
     return int(round(v * MM_TO_EMU))
 
 
+def _ensure_pz_page_count(project) -> int:
+    """Обеспечивает известное число листов собранного раздела ПЗ.
+
+    Содержание тома берёт листы раздела из собранного файла, а не из исходной
+    записки. Если рабочая копия раздела ещё не собрана или устарела, она
+    собирается здесь: иначе в содержании остались бы листы, посчитанные по
+    исходному DOCX, и «Лист N — M» не совпал бы с томом.
+
+    :return: число листов раздела (0 — определить не удалось).
+    """
+    try:
+        from .word_preview import (build_preview_docx, is_stale,
+                                   preview_page_count)
+        pages = preview_page_count(project)
+        if pages:
+            return pages
+        build_preview_docx(project)
+        return preview_page_count(project)
+    except Exception:
+        return 0
+
+
+def measure_pz_sheets(tom_path: str) -> int:
+    """Сколько листов занимает раздел ПЗ в ГОТОВОМ томе (0 — не измерить).
+
+    Границы раздела берутся по закладке `MIMO_PZSTART` (начало раздела) и
+    общему числу листов: раздел ПЗ — последний текстовый раздел тома, поэтому
+    его листы заканчиваются на последнем листе.
+
+    Нужно потому, что в контексте тома раздел занимает больше листов, чем при
+    сборке отдельно: секция начинается с новой страницы, действуют те же
+    штампы, но иначе ложится текст.
+    """
+    if not tom_path or not os.path.exists(tom_path):
+        return 0
+    # Word зависает на файлах в синхронизируемой папке (YandexDisk): клиент
+    # держит файл, и Documents.Open не возвращается. Поэтому файл копируется в
+    # системный временный каталог и измеряется оттуда.
+    import shutil
+    import tempfile
+    work = tempfile.mkdtemp(prefix="tom_measure_")
+    try:
+        path = os.path.join(work, "tom.docx")
+        shutil.copy2(tom_path, path)
+    except OSError:
+        shutil.rmtree(work, ignore_errors=True)
+        return 0
+    try:
+        from .word_com import ensure_pywin32
+        ensure_pywin32()
+        import win32com.client
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        return 0
+    try:
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        return 0
+    doc = None
+    pages = 0
+    try:
+        doc = word.Documents.Open(path, ReadOnly=True,
+                                  AddToRecentFiles=False, Visible=False)
+        try:
+            doc.Repaginate()
+            doc.Fields.Update()
+            doc.Repaginate()
+        except Exception:
+            pass
+        if not doc.Bookmarks.Exists(PZ_START_BOOKMARK):
+            return 0
+        # Information(3) — физический номер страницы в документе. Information(1)
+        # даёт печатный номер с учётом перезапуска внутри раздела (у ПЗ он
+        # начинается с 1), поэтому для счёта листов тома он не годится.
+        start = int(doc.Bookmarks(PZ_START_BOOKMARK).Range.Information(3))
+        total = int(doc.ComputeStatistics(2))
+        if start and total >= start:
+            pages = total - start + 1
+    except Exception:
+        pages = 0
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except Exception:
+                pass
+        try:
+            word.Quit()
+        except Exception:
+            pass
+        shutil.rmtree(work, ignore_errors=True)
+    return pages
+
+
+def build_text_docx_with_content(project: VolumeProject, out_path: str,
+                                 config: Config | None = None,
+                                 kinds: list | None = None) -> str:
+    """Собирает том, сверяя число листов ПЗ в содержании с готовым файлом.
+
+    Содержание тома строится раньше раздела ПЗ, поэтому число его листов
+    известно только приблизительно (по отдельно собранному разделу). После
+    сборки том измеряется по закладке `MIMO_PZSTART`, и если в содержании
+    оказалось другое число, том пересобирается с уточнённым значением —
+    максимум два прохода.
+
+    :return: путь к собранному DOCX.
+    """
+    from .toc import build_layout
+    path = build_text_docx(project, out_path, config=config, kinds=kinds)
+    if kinds is not None and SECTION_PZ not in [
+            k for k in kinds if k in TEXT_SECTION_KINDS]:
+        return path                       # раздел ПЗ не собирался
+    measured = measure_pz_sheets(path)
+    if not measured:
+        return path
+    used = 0
+    try:
+        for item in build_layout(project).items:
+            if item.kind == "pz":
+                used = int(item.count or 0)
+                break
+    except Exception:
+        used = 0
+    if used == measured:
+        return path
+    return build_text_docx(project, out_path, config=config, kinds=kinds,
+                           pz_pages=measured)
+
+
 def _set_section(page_w_mm, page_h_mm, margins: PageMargins, section):
     """Настраивает размер страницы и поля раздела DOCX."""
     section.page_width = _mm(page_w_mm)
@@ -56,25 +188,49 @@ def _set_section(page_w_mm, page_h_mm, margins: PageMargins, section):
 
 
 def _set_run(run, font: str, size_pt: float, bold=False, italic=False):
-    """Задаёт шрифт, кегль и начертание run-а.
+    """Задаёт шрифт, кегль, цвет и начертание run-а.
+
+    Оформление задаётся полностью, без наследования от стиля абзаца: стили
+    заголовков Word («Heading 1» …) несут свою тему шрифтов и синий цвет, из-за
+    чего нормализованный текст выглядел как исходный. Шрифт ставится во все
+    слоты письменности (латиница, кириллица, сложные и восточноазиатские
+    символы), кегль — и в `sz` и в `szCs`, цвет — автоматический (чёрный).
 
     :param italic: курсив; по умолчанию снимается (обычный текст записки
         выводится без курсива, заголовок передаёт курсив исходника).
     """
     from docx.shared import Pt
+    from docx.oxml.ns import qn
     run.font.name = font
     run.font.size = Pt(size_pt)
     run.bold = bold
     run.italic = italic
-    # восточно-европейский / кириллический шрифт
     rpr = run._element.get_or_add_rPr()
-    rFonts = rpr.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rFonts')
-    if rFonts is None:
-        rFonts = rpr.makeelement('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}rFonts', {})
-        rpr.append(rFonts)
-    rFonts.set('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}ascii', font)
-    rFonts.set('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}hAnsi', font)
-    rFonts.set('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}cs', font)
+    # Шрифт и кегль во ВСЕ слоты письменности: иначе Word берёт для кириллицы
+    # или восточноазиатских символов шрифт из стиля/темы.
+    rFonts = rpr.get_or_add_rFonts()
+    for attr in ('ascii', 'hAnsi', 'cs', 'eastAsia'):
+        rFonts.set(qn('w:' + attr), font)
+    # Тематические ссылки на шрифт перекрыли бы явный: убираем их.
+    for attr in ('asciiTheme', 'hAnsiTheme', 'cstheme', 'eastAsiaTheme'):
+        if rFonts.get(qn('w:' + attr)) is not None:
+            del rFonts.attrib[qn('w:' + attr)]
+    # Кегль для сложных письменностей: `w:szCs` ставится сразу после `w:sz`,
+    # иначе нарушается порядок элементов rPr.
+    if rpr.find(qn('w:szCs')) is None:
+        size_cs = OxmlElement('w:szCs')
+        rpr.insert_element_before(
+            size_cs, 'w:highlight', 'w:u', 'w:effect', 'w:bdr', 'w:shd',
+            'w:fitText', 'w:vertAlign', 'w:rtl', 'w:cs', 'w:em', 'w:lang',
+            'w:eastAsianLayout', 'w:specVanish', 'w:oMath')
+    rpr.find(qn('w:szCs')).set(qn('w:val'), str(int(round(float(size_pt) * 2))))
+    # Цвет — автоматический (чёрный): цвет из стиля заголовка не должен
+    # проступать в нормализованном тексте.
+    color = rpr.get_or_add_color()
+    color.set(qn('w:val'), 'auto')
+    for attr in ('themeColor', 'themeShade', 'themeTint'):
+        if color.get(qn('w:' + attr)) is not None:
+            del color.attrib[qn('w:' + attr)]
 
 
 # Текстовые kinds, участвующие в DOCX-томе (графика/приложения не входят).
@@ -98,7 +254,8 @@ def _structure_text_kinds(project: VolumeProject) -> list:
 
 def build_text_docx(project: VolumeProject, out_path: str,
                     config: Config | None = None,
-                    kinds: list | None = None) -> str:
+                    kinds: list | None = None,
+                    pz_pages: int | None = None) -> str:
     """Собирает DOCX текстовой части тома.
 
     Порядок и состав разделов берутся из ``project.structure`` (отфильтрованной
@@ -107,6 +264,10 @@ def build_text_docx(project: VolumeProject, out_path: str,
 
     Графика и приложения в текстовый DOCX не включаются (SPEC: DOC — без
     графики и приложений). Возвращает путь к созданному DOCX.
+
+    :param pz_pages: число листов раздела ПЗ для содержания. Передаётся вторым
+        проходом сборки (см. build_text_docx_with_content): при сборке в составе
+        тома раздел может занимать больше листов, чем при сборке отдельно.
     """
     config = config or Config()
     fm: FontMap = config.font_map
@@ -128,6 +289,13 @@ def build_text_docx(project: VolumeProject, out_path: str,
         if (k != SECTION_CHANGES or project.changes)
         and (k != SECTION_PZ or project.documents_for(DocKind.POYASNITELNAYA))
     ]
+
+    # Содержание тома считает листы по собранному разделу ПЗ, а не по исходной
+    # записке (оформление занимает больше места). Если рабочая копия раздела
+    # ещё не измерена — собираем её сейчас, иначе «Лист N — M» в содержании
+    # разойдётся с томом.
+    if SECTION_PZ in text_kinds:
+        _ensure_pz_page_count(project)
 
     doc = Document()
     # ---- Раздел по умолчанию: A4, поля ГОСТ ----
@@ -152,7 +320,7 @@ def build_text_docx(project: VolumeProject, out_path: str,
                                first_form=FORM_TEXT_FIRST_WORD,
                                section_kind=kind)
         elif kind == SECTION_CONTENT:
-            _add_content(doc, project, fm, font)
+            _add_content(doc, project, fm, font, pz_pages=pz_pages)
             _add_stamp_footers(doc, project, config, sec,
                                first_form=FORM_TEXT_FIRST_WORD,
                                section_kind=kind)
@@ -161,6 +329,7 @@ def build_text_docx(project: VolumeProject, out_path: str,
             # в разделе ПЗ) — ссылки из оглавления ведут в него.
             _toc_items, toc_path = project_toc_items(project)
             toc_anchors = anchor_map(_toc_items)
+            pz_start_index = len(doc.paragraphs)
             toc_pages = _add_pz_toc(doc, project, fm, font,
                                      text_fonts=getattr(config, "text_fonts", None))
             # Если оглавление заняло первый лист раздела, большая надпись уже
@@ -179,6 +348,12 @@ def build_text_docx(project: VolumeProject, out_path: str,
             _add_stamp_footers(doc, project, config, sec,
                                first_form=FORM_TEXT_FIRST_WORD,
                                section_kind=kind)
+            # Метка начала раздела: по ней второй проход измеряет, сколько
+            # листов раздел занял именно в томе, и содержание получает верное
+            # «Лист N — M».
+            if len(doc.paragraphs) > pz_start_index:
+                _add_bookmark(doc.paragraphs[pz_start_index],
+                              PZ_START_BOOKMARK, 900001)
         elif kind == SECTION_CHANGES:
             _add_changes_sheet(doc, project, fm, font)
             _add_stamp_footers(doc, project, config, sec,
@@ -194,6 +369,10 @@ def build_text_docx(project: VolumeProject, out_path: str,
                  font, fm.content_header)
 
     return _save_docx(doc, out_path)
+
+
+#: Имя закладки начала раздела ПЗ в собранном томе (для измерения листов).
+PZ_START_BOOKMARK = "MIMO_PZSTART"
 
 
 #: Внутренний отступ ячейки таблицы по умолчанию (мм) — столько Word
@@ -637,7 +816,7 @@ def _add_pz_toc(doc, project, fm, font, offset: int | None = None,
     return len(pages)
 
 
-def _add_content(doc, project, fm, font):
+def _add_content(doc, project, fm, font, pz_pages=None):
     """Содержание (опись) — автоматический сбор по фактической структуре тома.
 
     Строки содержания формируются единым источником (app.core.toc) по реальной
@@ -654,7 +833,7 @@ def _add_content(doc, project, fm, font):
     p = doc.add_paragraph(); p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _set_run(p.add_run("СОДЕРЖАНИЕ"), font, fm.content_header, bold=True)
 
-    rows = content_rows(project)    # [(наименование, обозначение, листы), ...]
+    rows = content_rows(project, pz_pages=pz_pages)    # [(наименование, обозначение, листы), ...]
 
     # Таблица содержания (3 колонки): Наименование | Обозначение | Листы.
     if rows:
@@ -1090,7 +1269,7 @@ def _apply_sheet_indent(p, pad_mm: float = SHEET_PAD_MM) -> None:
     pf.right_indent = Mm(right + pad_mm)
 
 
-def _apply_heading_style(paragraph, para) -> None:
+def _apply_heading_style(paragraph, para, font: str) -> None:
     """Переносит в собранный документ стиль заголовка исходной записки.
 
     Стиль (`Heading 1` … `Heading 3`) сохраняется, хотя оформление задаётся
@@ -1114,12 +1293,50 @@ def _apply_heading_style(paragraph, para) -> None:
         candidates.append("Заголовок %s" % match.group(1))
     for name in candidates:
         try:
-            paragraph.style = styles[name]
-            return
+            style = styles[name]
         except KeyError:
             continue
         except Exception:
             return
+        paragraph.style = style
+        _normalize_style_fonts(style, font)
+        return
+
+
+def _normalize_style_fonts(style, font: str) -> None:
+    """Приводит сам стиль заголовка к общему оформлению.
+
+    Стили `Heading N` шаблона python-docx несут тему шрифтов (`majorHAnsi`) и
+    синий цвет (`365F91` из акцента темы). Прямое оформление run-ов перекрывает
+    стиль, но стоит пользователю начать печатать в Word — новый текст берёт
+    оформление стиля и снова становится синим. Поэтому оформление стиля тоже
+    приводится к общему: шрифт из настроек, цвет — автоматический.
+    """
+    element = getattr(style, "element", None)
+    if element is None:
+        return
+    rpr = element.find(qn("w:rPr"))
+    if rpr is None:
+        return
+    rfonts = rpr.find(qn("w:rFonts"))
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr.insert(0, rfonts)
+    # Тематические ссылки перекрыли бы явный шрифт — убираем их.
+    for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme",
+                 "w:cstheme"):
+        if rfonts.get(qn(attr)) is not None:
+            del rfonts.attrib[qn(attr)]
+    for attr in ("ascii", "hAnsi", "cs", "eastAsia"):
+        rfonts.set(qn("w:" + attr), font)
+    color = rpr.find(qn("w:color"))
+    if color is None:
+        color = OxmlElement("w:color")
+        rpr.append(color)
+    for attr in ("w:themeColor", "w:themeShade", "w:themeTint"):
+        if color.get(qn(attr)) is not None:
+            del color.attrib[qn(attr)]
+    color.set(qn("w:val"), "auto")
 
 
 def _set_pz_pagination(paragraph, keep_with_next: bool = False) -> None:
@@ -1180,7 +1397,7 @@ def _add_pz_page(doc, page_items, content, row_owner, path, fm, font,
                 # (навигация, обновление поля оглавления), хотя оформление
                 # задаётся наше — шрифт, кегль и отступы проставлены явно и
                 # перекрывают стиль шаблона.
-                _apply_heading_style(p, para)
+                _apply_heading_style(p, para, run_font)
             _set_pz_pagination(p, keep_with_next=is_heading)
             fmt = getattr(para, "fmt", None)
             if break_pending or bool(getattr(fmt, "page_break_before", False)):

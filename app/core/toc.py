@@ -223,6 +223,27 @@ def _pz_toc_sheets(project) -> int:
         return 0
 
 
+def _pz_section_sheets(project, docs) -> int:
+    """Листы всего раздела ПЗ по СОБРАННОМУ разделу (0 — неизвестно).
+
+    Собранный раздел занимает больше листов, чем исходная записка: рамки,
+    штампы, оглавление и оформленные таблицы берут место. Поэтому содержание
+    тома не может считать листы по исходному DOCX — иначе «Лист N — M» в
+    содержании не совпадает с томом. Число берётся из рабочей копии
+    предпросмотра (`word_preview`), где оно измерено Word.
+
+    Возвращает 0, если копия не собрана, устарела или в разделе несколько
+    документов (тогда листы по документам не разделить).
+    """
+    if not docs or len(docs) > 1:
+        return 0
+    try:
+        from .word_preview import preview_page_count
+        return max(0, int(preview_page_count(project) or 0))
+    except Exception:
+        return 0
+
+
 def doc_label(d) -> str:
     """Человекочитаемое имя документа (по имени файла)."""
     p = getattr(d, "path", "") or ""
@@ -240,11 +261,17 @@ def appendix_designation(a) -> str:
     return f"Приложение {number}" if number else "Приложение"
 
 
-def build_layout(project: VolumeProject) -> VolumeLayout:
+def build_layout(project: VolumeProject, pz_pages: int | None = None) -> VolumeLayout:
     """Строит линейную карту листов тома (единый источник нумерации).
 
     Возвращает VolumeLayout: упорядоченные позиции (ContentItem) с фактическими
     диапазонами листов и общее число листов «Листов M».
+
+    :param pz_pages: фактическое число листов раздела ПЗ в ГОТОВОМ томе. Его
+        даёт второй проход сборки: при сборке в контексте тома раздел может
+        занимать больше листов, чем при сборке отдельно (секция начинается с
+        новой страницы, другие штампы). None — число берётся из собранной
+        рабочей копии раздела или оценивается по исходной записке.
     """
     layout = VolumeLayout()
     sheet = 1                       # текущий сквозной номер листа
@@ -313,6 +340,8 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
             # Автоматическое оглавление записки (app.core.pz_toc) занимает свои
             # листы ПЕРЕД первым документом раздела и также входит в «Листов M».
             toc_sheets = _pz_toc_sheets(project)
+            # Листы всего раздела по собранному файлу (0 — ещё не измерено).
+            packed = max(0, int(pz_pages or 0)) or _pz_section_sheets(project, docs)
             # Форма первого листа каждого документа — как в предпросмотре
             # (preview_html.pz_doc_first_forms): сказывается на разбивке DOCX.
             try:
@@ -322,7 +351,13 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
                 forms = []
             for index, d in enumerate(docs):
                 ff = forms[index] if index < len(forms) else 2
-                n = doc_sheet_count(d, first_form=ff) + (toc_sheets if index == 0 else 0)
+                if packed and index == 0:
+                    # Собранный раздел уже включает листы оглавления, поэтому
+                    # toc_sheets второй раз не прибавляется.
+                    n = packed
+                else:
+                    n = doc_sheet_count(d, first_form=ff) + (
+                        toc_sheets if index == 0 else 0)
                 layout.items.append(ContentItem(
                     title=doc_label(d), designation=design(SECTION_PZ),
                     first_sheet=sheet, last_sheet=sheet + n - 1, count=n,
@@ -390,7 +425,7 @@ def build_layout(project: VolumeProject) -> VolumeLayout:
     return layout
 
 
-def build_content_items(project: VolumeProject) -> list:
+def build_content_items(project: VolumeProject, pz_pages: int | None = None) -> list:
     """Перечень строк содержания (ContentItem) для вставки в том.
 
     Группирует карту листов так, как она отображается в содержании: документы
@@ -399,13 +434,13 @@ def build_content_items(project: VolumeProject) -> list:
 
     :return: упорядоченный список ContentItem (только включённые позиции).
     """
-    layout = build_layout(project)
+    layout = build_layout(project, pz_pages=pz_pages)
     if not layout.items:
         return []
     return layout.items
 
 
-def content_rows(project: VolumeProject) -> list:
+def content_rows(project: VolumeProject, pz_pages: int | None = None) -> list:
     """Строки содержания в виде кортежей (наименование, обозначение, листы).
 
     Удобно для построения таблицы содержания в DOCX/PDF/HTML.
@@ -421,7 +456,7 @@ def content_rows(project: VolumeProject) -> list:
     и без диапазона) — так требует ГОСТ Р 21.101-2020. Таким образом содержание
     отражает состав тома, а не перечень файлов.
     """
-    items = build_content_items(project)
+    items = build_content_items(project, pz_pages=pz_pages)
     # Строки собираются списком словарей: у приложений своё наименование и
     # обозначение, поэтому ключ группировки и подпись строки хранятся раздельно.
     rows = []

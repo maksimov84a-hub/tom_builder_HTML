@@ -147,6 +147,9 @@ class SheetPreview(QWidget):
         # Листы пояснительной записки показываются настоящим Word: файл уже
         # собран с оглавлением и номерами листов (см. core.word_preview).
         self.word_host = WordHost()
+        # Сохранение правок в Word меняет раскладку: число листов раздела
+        # пересчитывается, и содержание тома перестаёт отставать от записки.
+        self.word_host.modified_changed.connect(self._on_word_modified)
         self.preview_stack.addWidget(self.word_host)
         self.word_host.hide()
         self._word_mode = False
@@ -344,10 +347,36 @@ class SheetPreview(QWidget):
             stale = bool(is_stale(project, SECTION_PZ))
         except Exception:
             stale = False
+        self._refresh_pz_page_count()
         self._set_word_stale(stale)
         self.lbl_sheets.setText(
             "Лист Word" + (" · требует пересборки" if stale else ""))
         return True
+
+    def _on_word_modified(self, modified: bool) -> None:
+        """Word сообщил о правках: после сохранения обновляем число листов."""
+        if not modified:
+            self._refresh_pz_page_count()
+
+    def _refresh_pz_page_count(self) -> None:
+        """Запоминает фактическое число листов раздела — для содержания тома.
+
+        Содержание тома считает листы раздела ПЗ по собранному файлу, а не по
+        исходной записке (оформление занимает больше места). Число берётся из
+        открытого документа Word, поэтому содержание пересчитывается вместе с
+        запиской, а не остаётся прежним.
+        """
+        doc = getattr(self.word_host, "_doc", None)
+        if doc is None or self._project is None:
+            return
+        try:
+            from ..models import SECTION_PZ
+            from ..core.word_preview import set_preview_pages
+            pages = int(doc.ComputeStatistics(2))
+            if pages > 0:
+                set_preview_pages(self._project, SECTION_PZ, pages)
+        except Exception:
+            pass
 
     def _set_word_stale(self, stale: bool) -> None:
         """Помечает кнопку пересборки, когда документ отстал от настроек."""
@@ -418,6 +447,8 @@ class SheetPreview(QWidget):
             self.progress_overlay.setVisible(False)
         self._word_path = path
         opened = self.word_host.open_document(path)
+        if opened:
+            self._refresh_pz_page_count()
         self._set_word_stale(not opened)
         if opened:
             self.lbl_sheets.setText("Лист Word")
