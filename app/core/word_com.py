@@ -85,6 +85,15 @@ def docx_to_pdf(docx_path: str, pdf_path: str, visible: bool = False) -> str:
             # 0 = wdDoNotSaveChanges
             doc = word.Documents.Open(os.path.abspath(docx_path), ReadOnly=True,
                                       AddToRecentFiles=False, Visible=visible)
+            # Поля пересчитываются до экспорта: в оглавлении номера листов —
+            # поля PAGEREF, в штампе — PAGE/SECTIONPAGES. Без пересчёта в PDF
+            # ушли бы значения, посчитанные при сборке.
+            try:
+                doc.Repaginate()
+                doc.Fields.Update()
+                doc.Repaginate()
+            except Exception:
+                pass
             # 17 = wdFormatPDF
             doc.ExportAsFixedFormat(
                 OutputFileName=os.path.abspath(pdf_path),

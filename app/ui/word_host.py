@@ -92,10 +92,29 @@ class WordHost(QWidget):
         if result is None:
             return False
         self._word, self._doc, self._hwnd = result
+        self._update_fields()
         self._hint.hide()
         QTimer.singleShot(150, self._embed)
         self._poll.start()
         return True
+
+    def _update_fields(self) -> None:
+        """Пересчитывает поля документа: номера листов в оглавлении и штампе.
+
+        Номера в строках оглавления — поля `PAGEREF` на закладки заголовков,
+        «Лист/Листов» в штампе — поля `PAGE`/`SECTIONPAGES`. Word показывает их
+        кэшированные значения до пересчёта, поэтому сразу после открытия
+        документ пересчитывается: иначе в оглавлении остались бы номера,
+        посчитанные при сборке по раскладке исходной записки.
+        """
+        if self._doc is None:
+            return
+        try:
+            self._doc.Repaginate()
+            self._doc.Fields.Update()
+            self._doc.Repaginate()
+        except Exception:
+            pass
 
     def _open_live(self, path: str, read_only: bool):
         """Открывает файл в новом экземпляре Word: (word, doc, hwnd) или None."""

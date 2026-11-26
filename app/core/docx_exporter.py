@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from ..models import (
@@ -357,7 +358,16 @@ def _add_title_sheet(doc, project, fm, font):
 
 
 def _disable_external_update_prompt(path: str) -> None:
-    """Отключает обновление внешних ссылок при открытии DOCX в Word."""
+    """Просит Word пересчитать поля при открытии документа.
+
+    В оглавлении номера листов — поля `PAGEREF` на закладки заголовков: их
+    значения зависят от фактической раскладки, и Word должен обновить их сам.
+    Флаг `w:updateFields` заставляет его сделать это при открытии, поэтому в
+    предпросмотре и в PDF сразу видны верные номера.
+
+    Внешних ссылок в собираемых документах нет (все ссылки — внутренние
+    закладки), поэтому запроса «обновить внешние ссылки?» не возникает.
+    """
     import zipfile
     from lxml import etree
 
@@ -370,7 +380,7 @@ def _disable_external_update_prompt(path: str) -> None:
     if update_fields is None:
         update_fields = etree.SubElement(
             xml, "{%s}updateFields" % ns["w"])
-    update_fields.set("{%s}val" % ns["w"], "false")
+    update_fields.set("{%s}val" % ns["w"], "true")
     files[settings_path] = etree.tostring(
         xml, xml_declaration=True, encoding="UTF-8", standalone=True)
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as target:
@@ -610,8 +620,20 @@ def _add_pz_toc(doc, project, fm, font, offset: int | None = None,
             else:
                 _set_run(p.add_run(item.text), toc_font, size)
             if item.page:
-                _set_run(p.add_run("\t" + str(int(item.page) + max(0, int(offset or 0)))),
-                         toc_font, size)
+                _set_run(p.add_run("\t"), toc_font, size)
+                # Номер листа — ПОЛЕ PAGEREF на закладку заголовка: Word сам
+                # подставляет номер того листа, где заголовок оказался в
+                # собранном файле. Литеральное число приходилось бы считать по
+                # раскладке ИСХОДНОЙ записки, а собранный раздел занимает больше
+                # листов — напечатанные номера отставали от настоящих.
+                # `\h` делает номер гиперссылкой, `w:dirty` заставляет Word
+                # пересчитать поле при открытии.
+                cached = str(int(item.page) + max(0, int(offset or 0)))
+                if item.anchor:
+                    _field_runs(p, " PAGEREF %s \\h " % item.anchor,
+                                cached=cached, font=toc_font, size=size)
+                else:
+                    _set_run(p.add_run(cached), toc_font, size)
     return len(pages)
 
 
@@ -1068,6 +1090,38 @@ def _apply_sheet_indent(p, pad_mm: float = SHEET_PAD_MM) -> None:
     pf.right_indent = Mm(right + pad_mm)
 
 
+def _apply_heading_style(paragraph, para) -> None:
+    """Переносит в собранный документ стиль заголовка исходной записки.
+
+    Стиль (`Heading 1` … `Heading 3`) сохраняется, хотя оформление задаётся
+    наше: шрифт, кегль, отступы и интервалы проставляются явно и перекрывают
+    параметры стиля шаблона. Благодаря стилю Word видит структуру документа —
+    работает навигация по заголовкам и обновление поля оглавления, если его
+    вставят вручную.
+
+    Если стиля с таким именем в собранном документе нет (шаблон python-docx
+    знает только английские имена), берётся встроенный `Heading N` по номеру
+    из имени стиля исходника.
+    """
+    style_name = (getattr(para, "style_name", "") or "").strip()
+    if not style_name:
+        return
+    styles = paragraph.part.document.styles
+    candidates = [style_name]
+    match = re.search(r"(\d+)", style_name)
+    if match:
+        candidates.append("Heading %s" % match.group(1))
+        candidates.append("Заголовок %s" % match.group(1))
+    for name in candidates:
+        try:
+            paragraph.style = styles[name]
+            return
+        except KeyError:
+            continue
+        except Exception:
+            return
+
+
 def _set_pz_pagination(paragraph, keep_with_next: bool = False) -> None:
     """Отключает переносы абзаца, не заданные исходной вёрсткой.
 
@@ -1121,6 +1175,12 @@ def _add_pz_page(doc, page_items, content, row_owner, path, fm, font,
             is_heading = is_heading_paragraph(para)
             bold, italic = heading_emphasis(para)
             p = doc.add_paragraph()
+            if is_heading:
+                # Стиль заголовка сохраняется: Word видит структуру документа
+                # (навигация, обновление поля оглавления), хотя оформление
+                # задаётся наше — шрифт, кегль и отступы проставлены явно и
+                # перекрывают стиль шаблона.
+                _apply_heading_style(p, para)
             _set_pz_pagination(p, keep_with_next=is_heading)
             fmt = getattr(para, "fmt", None)
             if break_pending or bool(getattr(fmt, "page_break_before", False)):
